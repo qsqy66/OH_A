@@ -139,6 +139,36 @@ class Settings:
     # =====================================================================
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    def validate(self) -> list[str]:
+
+        errors = []
+        required = {
+            "GLM_API_KEY": self.GLM_API_KEY,
+            "GLM_BASE_URL": self.GLM_BASE_URL,
+            "GLM_MODEL_NAME": self.GLM_MODEL_NAME,
+            "GLM_EMBED_MODEL": self.GLM_EMBED_MODEL,
+            "GLM_LITE_MODEL": self.GLM_LITE_MODEL,
+        }
+        errors.extend(
+            f"缺少必填配置：{name}"
+            for name, value in required.items()
+            if not value.strip()
+        )
+        if self.LLM_MAX_RETRIES < 1:
+            errors.append("LLM_MAX_RETRIES 必须大于等于 1")
+        if self.LLM_TIMEOUT <= 0:
+            errors.append("LLM_TIMEOUT 必须大于 0")
+        if self.CHUNK_SIZE <= 0:
+            errors.append("CHUNK_SIZE 必须大于 0")
+        if not 0 <= self.CHUNK_OVERLAP < self.CHUNK_SIZE:
+            errors.append("CHUNK_OVERLAP 必须大于等于 0 且小于 CHUNK_SIZE")
+        return errors
+
+    def require_valid(self) -> None:
+        errors = self.validate()
+        if errors:
+            raise RuntimeError("配置校验失败：\n- " + "\n- ".join(errors))
+
 
 # ———— 全局单例 ————
 # 模块级变量在第一次 import 时初始化一次，之后所有地方共享同一实例。

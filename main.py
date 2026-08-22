@@ -4,12 +4,17 @@ import asyncio
 import json
 from memory.redis import Redis
 from structlog import get_logger
+from config import settings
 logger = get_logger(__name__)
 
 async def main():
+    settings.require_valid()
     select = input("请选择模式：1.多轮对话 2.TRACE查询\n")
     if select == "2":
         trace_id = input("请输入TRACE ID：")
+        if not trace_id:
+            print("TRACE ID不能为空")
+            return
         redis_trace = Redis()
         await redis_trace.connect()
         trace = await redis_trace.get_trace(trace_id)
