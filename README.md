@@ -42,6 +42,30 @@ python main.py
 
 输入 `1` 进入多轮对话，输入 `2` 根据 Trace ID 查询调用链；输入 `exit`、`quit` 或 `不聊了`退出。
 
+### 4. 启动 HTTP API
+
+先在 `.env` 中设置一个 API Key，然后运行：
+
+```powershell
+python -m uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+接口文档地址为 `http://localhost:8000/docs`。业务接口需要携带请求头：
+
+```text
+X-API-Key: 你的API_KEY
+```
+
+发送对话请求：
+
+```powershell
+$headers = @{ "X-API-Key" = "你的API_KEY" }
+$body = @{ session_id = "session-001"; user_id = "user-001"; query = "年假最多可以顺延多久？" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/chat -Headers $headers -ContentType "application/json" -Body $body
+```
+
+服务提供 `/health` 健康检查、`/api/v1/traces/{trace_id}` Trace 查询和 `/api/v1/knowledge/reindex` 知识库重建接口。
+
 ## 配置校验
 
 程序启动时会检查必填模型配置、超时、重试次数和 RAG 分块参数。配置不完整时会直接输出缺失项，而不是运行到第一次请求才失败。

@@ -14,24 +14,28 @@ class Redis:
             self.redis = aioredis.from_url(self.redis_url)
         
     @staticmethod
+    def _key(name: str) -> str:
+        return f"{settings.REDIS_PREFIX}{name}"
+
+    @staticmethod
     def _trace_key(trace_id: str,) -> str:
-        return f"trace:{trace_id}"
+        return Redis._key(f"trace:{trace_id}")
     
     @staticmethod
     def _history_key(trace_id: str) -> str:
-        return f"history:{trace_id}"
+        return Redis._key(f"history:{trace_id}")
 
     @staticmethod
     def _session_summary_key(session_id: str) -> str:
-        return f"memory:st:{session_id}:summary"
+        return Redis._key(f"memory:st:{session_id}:summary")
 
     @staticmethod
     def _profile_key(user_id: str) -> str:
-        return f"memory:lt:{user_id}:profile"
+        return Redis._key(f"memory:lt:{user_id}:profile")
 
     @staticmethod
     def _episodic_key(user_id: str) -> str:
-        return f"memory:lt:{user_id}:episodic"
+        return Redis._key(f"memory:lt:{user_id}:episodic")
     
     async def append_history(self, session_id: str, message: dict):
         key = self._history_key(session_id)
@@ -162,5 +166,5 @@ class Redis:
             logger.error(f"{trace_id}_trace_validate_error", error=str(e))
             return None
     async def close(self):
-        await self.redis.close()
-        
+        if self.redis is not None:
+            await self.redis.close()

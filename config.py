@@ -132,6 +132,7 @@ class Settings:
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
     API_RATE_LIMIT: str = os.getenv("API_RATE_LIMIT", "100/minute")
+    API_KEY: str = os.getenv("API_KEY", "")
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 
     # =====================================================================
