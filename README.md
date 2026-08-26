@@ -72,4 +72,6 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/chat -Headers $
 
 ## 当前边界
 
-当前入口是 CLI，`web_search` 仍是演示用 Mock，项目暂未提供 HTTP API、用户鉴权和自动化测试。这些是后续服务化阶段的工作项。
+联网搜索使用 Brave Search API，需要在 `.env` 中配置 `SEARCH_API_KEY`；未配置时会明确返回不可用，不会伪造搜索结果。工具参数会经过严格校验，计算器不执行任意 Python 代码，Excel 只能读取 `data/` 目录内的表格文件。
+
+当前仍未覆盖生产级分布式限流、自动化测试和多实例共享限流状态，这些属于后续增强项。

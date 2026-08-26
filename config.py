@@ -119,12 +119,18 @@ class Settings:
     # =====================================================================
     SEARCH_TIMEOUT: float = float(os.getenv("SEARCH_TIMEOUT", "15.0"))
     SEARCH_MAX_RESULTS: int = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
+    SEARCH_API_KEY: str = os.getenv("SEARCH_API_KEY", "")
+    SEARCH_ENDPOINT: str = os.getenv(
+        "SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search"
+    )
 
     # =====================================================================
     #  八、工具调用配置
     # =====================================================================
     # 单个工具失败后最多重试几次
     TOOL_MAX_RETRIES: int = int(os.getenv("TOOL_MAX_RETRIES", "3"))
+    TOOL_TIMEOUT: float = float(os.getenv("TOOL_TIMEOUT", "30.0"))
+    TOOL_OUTPUT_MAX_CHARS: int = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "12000"))
 
     # =====================================================================
     #  九、FastAPI 服务配置
@@ -163,6 +169,10 @@ class Settings:
             errors.append("CHUNK_SIZE 必须大于 0")
         if not 0 <= self.CHUNK_OVERLAP < self.CHUNK_SIZE:
             errors.append("CHUNK_OVERLAP 必须大于等于 0 且小于 CHUNK_SIZE")
+        if self.TOOL_TIMEOUT <= 0:
+            errors.append("TOOL_TIMEOUT 必须大于 0")
+        if self.TOOL_OUTPUT_MAX_CHARS <= 0:
+            errors.append("TOOL_OUTPUT_MAX_CHARS 必须大于 0")
         return errors
 
     def require_valid(self) -> None:

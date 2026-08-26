@@ -8,7 +8,17 @@ async def read_excel(filename: str, sheet_name: str) -> str:
     读取Excel指定工作表；
     当传入的sheet_name不存在时，会直接返回该文件全部工作表名称，方便重新选择。
     """
-    filepath = DATA_DIR / filename
+    if not filename or not sheet_name or len(filename) > 255 or len(sheet_name) > 128:
+        return "错误：文件名和工作表名不能为空且长度超限。"
+
+    data_root = DATA_DIR.resolve()
+    filepath = (data_root / filename).resolve()
+    try:
+        filepath.relative_to(data_root)
+    except ValueError:
+        return "错误：只能读取 data 目录中的文件。"
+    if filepath.suffix.lower() not in {".xlsx", ".xls"}:
+        return "错误：只支持 .xlsx 和 .xls 文件。"
     if not filepath.exists():
         return f"错误：文件 '{filename}' 不存在。"
 
