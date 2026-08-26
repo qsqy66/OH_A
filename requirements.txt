@@ -4,6 +4,7 @@ openai>=1.0,<4
 openpyxl>=3.1,<4
 pandas>=2.0,<4
 pydantic>=2.0,<3
+pytest>=8.0,<9
 python-dotenv>=1.0,<2
 redis>=5.0,<8
 structlog>=24.0,<27

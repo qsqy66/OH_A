@@ -66,6 +66,14 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/chat -Headers $
 
 服务提供 `/health` 健康检查、`/api/v1/traces/{trace_id}` Trace 查询和 `/api/v1/knowledge/reindex` 知识库重建接口。
 
+### 5. 运行测试
+
+```powershell
+python -m pytest -q
+```
+
+测试不依赖真实 LLM、联网搜索或 Redis，会自动隔离外部服务并验证核心安全边界。
+
 ## 配置校验
 
 程序启动时会检查必填模型配置、超时、重试次数和 RAG 分块参数。配置不完整时会直接输出缺失项，而不是运行到第一次请求才失败。
