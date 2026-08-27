@@ -32,6 +32,7 @@ Thumbs.db
 # —— 测试 & 覆盖率 ——
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 .tox/
 .mypy_cache/
@@ -46,6 +47,7 @@ build/
 # —— 运行时数据 ——
 #docs/
 chroma_data/
+vector_data/
 *.db
 *.sqlite3
 
