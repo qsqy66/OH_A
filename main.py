@@ -1,4 +1,5 @@
 from core.agent_loop import AgentLoop
+from core.rag import get_rag_engine
 from tools.registry import TOOLS_SCHEMA
 import asyncio
 import json
@@ -7,9 +8,21 @@ from structlog import get_logger
 from config import settings
 logger = get_logger(__name__)
 
+async def reindex_knowledge():
+    try:
+        count = await get_rag_engine().index_documents(force=True)
+        if count == 0:
+            print("知识库为空：请把文档放到 docs 目录下，然后重试。")
+        else:
+            print(f"知识库更新完成，共入库 {count} 个片段。")
+    except Exception as exc:
+        logger.exception("cli_reindex_error", error=str(exc))
+        print(f"知识库更新失败：{exc}")
+
+
 async def main():
     settings.require_valid()
-    select = input("请选择模式：1.多轮对话 2.TRACE查询\n")
+    select = input("请选择模式：1.多轮对话 2.TRACE查询 3.更新RAG知识库\n")
     if select == "2":
         trace_id = input("请输入TRACE ID：")
         if not trace_id:
@@ -26,6 +39,8 @@ async def main():
         else:
             print("未找到对应的TRACE信息")
         await redis_trace.close()
+    elif select == "3":
+        await reindex_knowledge()
     else:
         agent = AgentLoop()
         session_id = "text_1"
