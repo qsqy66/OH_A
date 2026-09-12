@@ -29,6 +29,7 @@ class ChatResponse(BaseModel):
 
 class ReindexResponse(BaseModel):
     indexed_chunks: int
+    events: list[str] = []
 
 
 class InMemoryRateLimiter:
@@ -175,8 +176,8 @@ async def get_trace(trace_id: str) -> dict:
 async def reindex() -> ReindexResponse:
     require_runtime_config()
     try:
-        indexed_chunks = await get_rag_engine().index_documents(force=True)
-        return ReindexResponse(indexed_chunks=indexed_chunks)
+        result = await get_rag_engine().index_documents()
+        return ReindexResponse(indexed_chunks=result["indexed_chunks"], events=result["events"])
     except Exception as exc:
         logger.exception("api_reindex_error", error=str(exc))
         raise HTTPException(status_code=502, detail="知识库重建失败，请稍后重试") from exc

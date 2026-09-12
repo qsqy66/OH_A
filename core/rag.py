@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -32,8 +33,12 @@ def _read_table_file(path: Path) -> str:
     return f"文件：{path.name}\n" + "\n\n".join(parts)
 
 
-def _file_version(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _now_version() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def load_documents(docs_dir) -> list[dict]:
@@ -58,7 +63,7 @@ def load_documents(docs_dir) -> list[dict]:
                 docs.append({
                     "source": path.name,
                     "text": text,
-                    "version": _file_version(path),
+                    "sha256": _file_sha256(path),
                 })
         except Exception as exc:
             logger.error("rag_read_file_error", file=path.name, error=str(exc))
@@ -134,39 +139,124 @@ class RAGEngine:
             encoding="utf-8",
         )
 
-    async def index_documents(self, force: bool = False) -> int:
-        if self.chunks and not force:
-            return 0
+    async def _embed_doc(self, llm, doc: dict, version: str) -> list[dict]:
+        pieces = chunk_text(doc["text"], settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
+        positions = _chunk_metadata(doc["text"], pieces)
+        embeddings = await llm.embed_texts(pieces)
+        chunks = []
+        for index, (piece, vector, position) in enumerate(zip(pieces, embeddings, positions)):
+            chunks.append({
+                "id": f"{doc['source']}:{doc['sha256']}:{index}",
+                "source": doc["source"],
+                "sha256": doc["sha256"],
+                "version": version,
+                "page": position["page"],
+                "line_start": position["line_start"],
+                "line_end": position["line_end"],
+                "text": piece,
+                "embedding": [float(value) for value in vector],
+            })
+        return chunks
 
+    async def index_documents(self, force: bool = False) -> dict:
+        """按「文件名 + SHA256」增量更新向量库。
+
+        返回 {"indexed_chunks": 总片段数, "events": [人类可读的变更提示]}。
+
+        - 文件名与 SHA256 都不变 → 内容未变，不重新向量化，版本不变；
+        - 文件名不变、SHA256 变 → 内容更新，重新向量化，版本设为当前时间；
+        - 文件名变、SHA256 不变 → 只更新片段元数据里的文件名；
+        - 两者都变或全新 → 按新文件处理；
+        - 旧索引里存在但当前 docs 中不存在的 → 视为删除。
+        """
         docs = load_documents(settings.DOCS_DIR)
         if not docs:
             self.chunks = []
-            return 0
+            self._save()
+            return {"indexed_chunks": 0, "events": ["知识库为空：docs 目录下没有可入库的文档。"]}
+
+        if force:
+            return await self._full_reindex(docs)
+
+        # 只保留带 sha256 的片段（旧索引无 sha256，会被当作新文件重新入库）
+        existing_by_source: dict[str, list[dict]] = {}
+        for chunk in self.chunks:
+            if "sha256" not in chunk:
+                continue
+            existing_by_source.setdefault(chunk["source"], []).append(chunk)
+        existing_sha_by_source = {
+            source: chunks[0]["sha256"]
+            for source, chunks in existing_by_source.items()
+            if chunks
+        }
 
         llm = get_llm_client()
-        new_chunks = []
-        index = 0
+        new_chunks: list[dict] = []
+        events: list[str] = []
+        claimed: set[str] = set()
+
         for doc in docs:
-            pieces = chunk_text(doc["text"], settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
-            positions = _chunk_metadata(doc["text"], pieces)
-            embeddings = await llm.embed_texts(pieces)
-            for piece, vector, position in zip(pieces, embeddings, positions):
-                new_chunks.append({
-                    "id": f"{doc['source']}:{doc['version']}:{index}",
-                    "source": doc["source"],
-                    "version": doc["version"],
-                    "page": position["page"],
-                    "line_start": position["line_start"],
-                    "line_end": position["line_end"],
-                    "text": piece,
-                    "embedding": [float(value) for value in vector],
-                })
-                index += 1
+            source = doc["source"]
+            sha = doc["sha256"]
+
+            # 1) 文件名与 SHA256 都不变 → 内容未变
+            if source in existing_by_source and existing_sha_by_source.get(source) == sha:
+                new_chunks.extend(existing_by_source[source])
+                claimed.add(source)
+                continue
+
+            # 2) 文件名不变但 SHA256 变 → 内容更新
+            if source in existing_by_source:
+                version = _now_version()
+                new_chunks.extend(await self._embed_doc(llm, doc, version))
+                claimed.add(source)
+                events.append(f"文件更新：{source}（版本 {version}）")
+                continue
+
+            # 3) 文件名变但 SHA256 不变 → 只改元数据里的文件名
+            rename_candidates = [
+                old for old, old_sha in existing_sha_by_source.items()
+                if old_sha == sha and old not in claimed
+            ]
+            if rename_candidates:
+                old = rename_candidates[0]
+                for chunk in existing_by_source[old]:
+                    renamed = dict(chunk)
+                    renamed["source"] = source
+                    renamed["id"] = f"{source}:{sha}:{renamed['id'].rsplit(':', 1)[-1]}"
+                    new_chunks.append(renamed)
+                claimed.add(old)
+                events.append(f"文件名变更：{old} → {source}")
+                continue
+
+            # 4) 全新文件
+            version = _now_version()
+            new_chunks.extend(await self._embed_doc(llm, doc, version))
+            events.append(f"新增文件：{source}（版本 {version}）")
+
+        # 5) 删除检测：旧索引里未被认领的来源
+        for old in existing_by_source:
+            if old not in claimed:
+                events.append(f"文件已删除：{old}")
 
         self.chunks = new_chunks
         self._save()
-        logger.info("rag_indexed", chunks=len(self.chunks), backend="json")
-        return len(self.chunks)
+        logger.info("rag_indexed", chunks=len(self.chunks), backend="json", events=len(events))
+        return {"indexed_chunks": len(self.chunks), "events": events}
+
+    async def _full_reindex(self, docs: list[dict]) -> dict:
+        llm = get_llm_client()
+        version = _now_version()
+        new_chunks = []
+        for doc in docs:
+            new_chunks.extend(await self._embed_doc(llm, doc, version))
+        self.chunks = new_chunks
+        self._save()
+        logger.info("rag_reindexed", chunks=len(self.chunks), backend="json")
+        return {
+            "indexed_chunks": len(self.chunks),
+            "events": [f"全量重建：{len(docs)} 个文件，版本 {version}"],
+        }
 
     async def retrieve(self, query: str, top_k: int | None = None) -> list[dict]:
         top_k = top_k or settings.RAG_TOP_K
@@ -200,8 +290,8 @@ def get_rag_engine() -> RAGEngine:
 async def search_docs(query: str, top_k: int | None = None) -> str:
     engine = get_rag_engine()
     if not engine.chunks:
-        count = await engine.index_documents()
-        if count == 0:
+        result = await engine.index_documents()
+        if result["indexed_chunks"] == 0:
             return "知识库为空：请把文档放到 docs 目录下，然后重试。"
 
     results = await engine.retrieve(query, top_k)
@@ -212,8 +302,8 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
     for index, result in enumerate(results, 1):
         location = f"第 {result['line_start']}-{result['line_end']} 行"
         lines.append(
-            f"\n[片段{index}] 来源：{result['source']}（版本：{result['version']}，"
-            f"页码：{result['page']}，{location}，相关度：{result['similarity']}）\n"
-            f"{result['text']}"
+            f"\n[片段{index}] 来源：{result['source']}（SHA256：{result['sha256']}，"
+            f"版本：{result['version']}，页码：{result['page']}，{location}）"
+            f"\n相关度：{result['similarity']}\n{result['text']}"
         )
     return "\n".join(lines)

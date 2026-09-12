@@ -24,7 +24,7 @@ SYSTEM_PROMPT = """
 只输出标准的function‑call工具调用，不要输出自然语言思考内容。
 所有推理只在function‑call内部完成，不要把思考写在输出文本中。
 如果需要向用户提问，直接在tool调用结束后的assistant content返回，不要混入工具参数
-如果使用了 search_docs，最终回答必须包含“来源：文件名”形式的来源信息；不能只给结论而省略来源。
+如果使用了 search_docs，最终回答的溯源信息（来源文件、SHA256、版本、页码与行号）由系统自动附加，你无需在回答中重复输出来源。
 """
 
 
@@ -32,11 +32,11 @@ def _append_sources(answer: str, sources: list[str]) -> str:
     unique_sources = list(dict.fromkeys(source for source in sources if source))
     if not unique_sources or "来源：" in answer:
         return answer
-    return answer.rstrip() + "\n\n来源：" + "、".join(unique_sources)
+    return answer.rstrip() + "\n\n" + "\n".join(f"来源：{s}" for s in unique_sources)
 
 
 def _extract_sources(tool_output: str) -> list[str]:
-    return re.findall(r"来源：([^（\n]+)", tool_output or "")
+    return re.findall(r"来源：([^）]+）)", tool_output or "")
 
 
 def _build_memory_block(memory_ctx: dict) -> str:

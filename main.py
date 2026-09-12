@@ -10,11 +10,13 @@ logger = get_logger(__name__)
 
 async def reindex_knowledge():
     try:
-        count = await get_rag_engine().index_documents(force=True)
-        if count == 0:
+        result = await get_rag_engine().index_documents()
+        for event in result["events"]:
+            print(event)
+        if result["indexed_chunks"] == 0:
             print("知识库为空：请把文档放到 docs 目录下，然后重试。")
         else:
-            print(f"知识库更新完成，共入库 {count} 个片段。")
+            print(f"知识库更新完成，共入库 {result['indexed_chunks']} 个片段。")
     except Exception as exc:
         logger.exception("cli_reindex_error", error=str(exc))
         print(f"知识库更新失败：{exc}")

@@ -82,7 +82,7 @@ def test_agent_executes_tool_and_appends_source(monkeypatch):
     monkeypatch.setattr(agent_loop, "get_memory_manager", lambda: FakeMemory())
 
     async def fake_tool(_name, _arguments):
-        return "已检索制度。来源：公司制度.md（版本：abc，页码：N/A，第 1-2 行）"
+        return "已检索制度。\n[片段1] 来源：公司制度.md（SHA256：abc123，版本：2026-10-21 15:47:00，页码：N/A，第 1-2 行）\n相关度：0.9\n正文内容"
 
     monkeypatch.setattr(agent_loop, "tools_excutor", fake_tool)
     calls = [tool_call("search_docs", '{"query":"年假"}')]
@@ -92,9 +92,28 @@ def test_agent_executes_tool_and_appends_source(monkeypatch):
 
     answer, trace = run_agent(agent, redis, query="年假怎么规定？")
 
-    assert "来源：公司制度.md" in answer
+    assert "来源：公司制度.md（SHA256：abc123，版本：2026-10-21 15:47:00，页码：N/A，第 1-2 行）" in answer
     assert any(step.tool_name == "search_docs" for step in trace.steps)
     assert agent.llm.calls == 2
+
+
+def test_extract_sources_captures_full_provenance():
+    tool_output = (
+        "已从本地知识库检索到 2 条相关内容：\n"
+        "[片段1] 来源：公司制度.md（SHA256：abc123，版本：2026-10-21 15:47:00，页码：N/A，第 1-2 行）\n相关度：0.9\n正文A\n"
+        "[片段2] 来源：差旅标准.csv（SHA256：def456，版本：2026-10-21 15:47:00，页码：N/A，第 3-3 行）\n相关度：0.8\n正文B"
+    )
+    assert agent_loop._extract_sources(tool_output) == [
+        "公司制度.md（SHA256：abc123，版本：2026-10-21 15:47:00，页码：N/A，第 1-2 行）",
+        "差旅标准.csv（SHA256：def456，版本：2026-10-21 15:47:00，页码：N/A，第 3-3 行）",
+    ]
+
+
+def test_append_sources_includes_version_page_line():
+    answer = "年假最多顺延至次年三月。"
+    sources = ["公司制度.md（SHA256：abc123，版本：2026-10-21 15:47:00，页码：N/A，第 1-2 行）"]
+    result = agent_loop._append_sources(answer, sources)
+    assert "来源：公司制度.md（SHA256：abc123，版本：2026-10-21 15:47:00，页码：N/A，第 1-2 行）" in result
 
 
 def test_agent_retries_llm_failure_then_returns(monkeypatch):
