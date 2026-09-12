@@ -90,7 +90,8 @@ def _chunk_recall(results: list[dict], question: dict) -> float | None:
 
 _EXTRACT_CLAIMS_PROMPT = (
     "你是信息抽取助手。请把下面「回答」拆解为若干原子论断（atomic claims），"
-    "每条论断只包含一个可独立判断真伪的事实主张。"
+    "每条论断只包含一个可独立判断真伪的事实主张，且必须自包含：保留主语与限定条件（如城市、职级、金额单位），"
+    "不要丢失上下文导致过度泛化（例如应写「杭州的住宿标准为400元/晚」，而不是「住宿标准为400元/晚」）。"
     "严格输出 JSON 数组，每个元素是一个字符串，不要输出任何其他内容。"
     "若回答为空或没有可拆解的事实，输出 []。"
 )
@@ -99,7 +100,7 @@ _VERIFY_CLAIM_PROMPT = (
     "你是事实核验助手。请判断「论断」是否被「资料」支持。"
     "资料明确包含该论断，或该论断可由资料中的规则直接推理得出（例如时间先后、数值大小、条件满足），都算支持；"
     "资料未提及、与资料矛盾、或需要资料之外的额外假设，都不算支持。"
-    "只输出一个词：支持、不支持 或 无法判断。"
+    "只输出一个词：支持、不支持 或 无法判断，不要输出任何解释或其他内容。"
 )
 
 
@@ -125,7 +126,11 @@ async def evaluate_faithfulness(llm, answer: str, context: str) -> dict:
             )).strip()
         ok = _verdict_supported(verdict)
         supported += int(ok)
-        verdicts.append({"claim": claim, "verdict": verdict, "supported": ok})
+        verdicts.append({
+            "claim": claim,
+            "verdict": verdict.splitlines()[0].strip() if verdict else "",
+            "supported": ok,
+        })
 
     return {
         "faithfulness": round(supported / len(claims), 4),
