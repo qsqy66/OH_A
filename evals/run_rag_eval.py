@@ -97,7 +97,8 @@ _EXTRACT_CLAIMS_PROMPT = (
 
 _VERIFY_CLAIM_PROMPT = (
     "你是事实核验助手。请判断「论断」是否被「资料」支持。"
-    "只有资料中明确包含该论断的信息才算支持；资料未提及、与资料矛盾或仅部分支持，都不算支持。"
+    "资料明确包含该论断，或该论断可由资料中的规则直接推理得出（例如时间先后、数值大小、条件满足），都算支持；"
+    "资料未提及、与资料矛盾、或需要资料之外的额外假设，都不算支持。"
     "只输出一个词：支持、不支持 或 无法判断。"
 )
 
@@ -116,6 +117,12 @@ async def evaluate_faithfulness(llm, answer: str, context: str) -> dict:
         verdict = (await llm.lite_chat(
             _VERIFY_CLAIM_PROMPT, f"资料：\n{context}\n\n论断：\n{claim}"
         )).strip()
+        if not verdict:
+            # 偶发空回复时再问一次，明确要求输出
+            verdict = (await llm.lite_chat(
+                _VERIFY_CLAIM_PROMPT + "必须输出一个词，不要留空。",
+                f"资料：\n{context}\n\n论断：\n{claim}",
+            )).strip()
         ok = _verdict_supported(verdict)
         supported += int(ok)
         verdicts.append({"claim": claim, "verdict": verdict, "supported": ok})
