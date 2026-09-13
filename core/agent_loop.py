@@ -56,8 +56,9 @@ def _build_memory_block(memory_ctx: dict) -> str:
 
 class AgentLoop():
     def __init__(self):
-        self.llm = get_llm_client()
-        
+        # 懒加载：不在实例化时创建 LLM 客户端，避免无 API Key 时 import/实例化即失败
+        self.llm = None
+
     async def run(
         self,
         session_id,
@@ -68,6 +69,8 @@ class AgentLoop():
         query: str = "",
     ):
 
+        if self.llm is None:
+            self.llm = get_llm_client()
         user_id = user_id or session_id
         messages = history.copy() if history else []
         messages.insert(0, {"role":"system","content":SYSTEM_PROMPT})
