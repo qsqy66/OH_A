@@ -8,6 +8,7 @@ import structlog
 
 from config import settings
 from core.llm_client import get_llm_client
+from core.tarce import current_trace
 
 logger = structlog.get_logger(__name__)
 
@@ -287,6 +288,27 @@ def get_rag_engine() -> RAGEngine:
     return _rag_engine
 
 
+_QUERY_REWRITE_PROMPT = (
+    "你是检索查询改写助手。把用户的口语化问题改写成适合在文档知识库中做语义检索的检索式："
+    "补全关键词、保留专有名词与数字、去除寒暄和无关措辞。"
+    "只输出改写后的检索式，不要任何解释。"
+)
+
+
+async def _rewrite_query(query: str) -> str:
+    """用轻量模型把口语化问题改写成检索式；关闭或失败时回退原始问题。"""
+    if not settings.RAG_QUERY_REWRITE:
+        return query
+    try:
+        rewritten = (await get_llm_client().lite_chat(
+            _QUERY_REWRITE_PROMPT, f"问题：{query}"
+        )).strip()
+        return rewritten or query
+    except Exception as exc:
+        logger.warning("rag_query_rewrite_failed", error=str(exc))
+        return query
+
+
 async def search_docs(query: str, top_k: int | None = None) -> str:
     engine = get_rag_engine()
     if not engine.chunks:
@@ -294,7 +316,27 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
         if result["indexed_chunks"] == 0:
             return "知识库为空：请把文档放到 docs 目录下，然后重试。"
 
-    results = await engine.retrieve(query, top_k)
+    search_query = await _rewrite_query(query)
+    results = await engine.retrieve(search_query, top_k)
+
+    trace = current_trace.get()
+    if trace is not None:
+        trace.add_step(
+            step_type="rag_retrieve",
+            description="知识库检索",
+            rewritten_query=search_query if search_query != query else None,
+            retrieved_chunks=[
+                {
+                    "source": item["source"],
+                    "version": item["version"],
+                    "line_start": item["line_start"],
+                    "line_end": item["line_end"],
+                    "similarity": item["similarity"],
+                }
+                for item in results
+            ],
+        ).finish()
+
     if not results:
         return "未在知识库中检索到相关内容。"
 
@@ -302,8 +344,8 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
     for index, result in enumerate(results, 1):
         location = f"第 {result['line_start']}-{result['line_end']} 行"
         lines.append(
-            f"\n[片段{index}] 来源：{result['source']}（SHA256：{result['sha256']}，"
-            f"版本：{result['version']}，页码：{result['page']}，{location}）"
+            f"\n[片段{index}] 来源：{result['source']}（版本：{result['version']}，"
+            f"页码：{result['page']}，{location}）"
             f"\n相关度：{result['similarity']}\n{result['text']}"
         )
     return "\n".join(lines)

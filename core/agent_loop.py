@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 import sys
 from tools.registry import tools_excutor, build_tool_message
-from core.tarce import TraceLog, TraceStep
+from core.tarce import TraceLog, TraceStep, current_trace
 from core.llm_client import LLMClient, get_llm_client
 from memory.manager import get_memory_manager
 logger = structlog.get_logger(__name__)
@@ -24,7 +24,7 @@ SYSTEM_PROMPT = """
 只输出标准的function‑call工具调用，不要输出自然语言思考内容。
 所有推理只在function‑call内部完成，不要把思考写在输出文本中。
 如果需要向用户提问，直接在tool调用结束后的assistant content返回，不要混入工具参数
-如果使用了 search_docs，最终回答的溯源信息（来源文件、SHA256、版本、页码与行号）由系统自动附加，你无需在回答中重复输出来源。
+如果使用了 search_docs，最终回答的溯源信息（来源文件、版本、页码与行号）由系统自动附加，你无需在回答中重复输出来源。
 """
 
 
@@ -77,6 +77,7 @@ class AgentLoop():
         messages.append({"role":"user","content":query})
         await redis.append_history(session_id, {"role":"user","content":query})
         trace = TraceLog(session_id=session_id)
+        _trace_token = current_trace.set(trace)
         retrieved_sources: list[str] = []
 
         # —— 记忆注入：短期(会话摘要) + 长期(用户画像 / 相关情景记忆) ——
@@ -191,6 +192,7 @@ class AgentLoop():
                     ),
                 ).finish()
                 await redis.save_trace(trace)
+                current_trace.reset(_trace_token)
                 return chat_content, trace
         
         # 循环15轮耗尽上限兜底
@@ -204,4 +206,5 @@ class AgentLoop():
             ),
         ).finish()
         await redis.save_trace(trace)
+        current_trace.reset(_trace_token)
         return over_limit_msg, trace

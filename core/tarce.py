@@ -3,6 +3,11 @@ import uuid
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, Optional, List
 from enum import StrEnum
+from contextvars import ContextVar
+
+
+# 当前请求的 TraceLog，由 AgentLoop 设置，供 RAG 检索等深层组件写入 Trace 步骤
+current_trace: ContextVar = ContextVar("current_trace", default=None)
 
 
 class StepType(StrEnum):

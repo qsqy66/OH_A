@@ -112,6 +112,9 @@ class Settings:
     # 检索相关性阈值（0~1），低于此值自动切换联网搜索
     RAG_RELEVANCE_THRESHOLD: float = float(os.getenv("RAG_RELEVANCE_THRESHOLD", "0.5"))
 
+    # 查询改写开关：用轻量模型把口语化问题改写成检索式，失败自动回退原问题
+    RAG_QUERY_REWRITE: bool = os.getenv("RAG_QUERY_REWRITE", "true").lower() in ("1", "true", "yes")
+
     # =====================================================================
     #  七、联网搜索配置
     # =====================================================================

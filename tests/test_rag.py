@@ -4,6 +4,7 @@ import numpy as np
 
 from core import rag
 from core.rag import chunk_text, cosine_similarity
+from core.tarce import TraceLog
 
 
 def test_chunk_text_preserves_overlap():
@@ -85,3 +86,67 @@ def test_index_documents_incremental(monkeypatch):
     assert any("文件更新：b.md" in e for e in events)
     assert any("文件名变更：old_c.md → c_新名.md" in e for e in events)
     assert any("新增文件：d.md" in e for e in events)
+
+
+def test_rewrite_query_disabled_returns_original(monkeypatch):
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_REWRITE", False)
+    assert asyncio.run(rag._rewrite_query("去杭州出差住宿标准多少")) == "去杭州出差住宿标准多少"
+
+
+def test_rewrite_query_fails_open(monkeypatch):
+    class BoomLLM:
+        async def lite_chat(self, *_args, **_kwargs):
+            raise RuntimeError("no api")
+
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_REWRITE", True)
+    monkeypatch.setattr(rag, "get_llm_client", lambda: BoomLLM())
+    assert asyncio.run(rag._rewrite_query("原始问题")) == "原始问题"
+
+
+def test_rewrite_query_returns_rewritten(monkeypatch):
+    class FakeLLM:
+        async def lite_chat(self, *_args, **_kwargs):
+            return "杭州 出差 住宿 报销 标准"
+
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_REWRITE", True)
+    monkeypatch.setattr(rag, "get_llm_client", lambda: FakeLLM())
+    assert asyncio.run(rag._rewrite_query("我去杭州住一晚能报多少钱")) == "杭州 出差 住宿 报销 标准"
+
+
+def test_search_docs_records_rag_retrieve_trace(monkeypatch):
+    class FakeLLM:
+        async def lite_chat(self, *_args, **_kwargs):
+            return "改写后的检索式"
+
+    class FakeEngine:
+        chunks = [{"source": "x"}]
+
+        async def retrieve(self, _query, _top_k=None):
+            return [{
+                "source": "公司考勤与请假制度.md",
+                "sha256": "abc123",
+                "version": "2026-08-27 19:36:13",
+                "page": "N/A",
+                "line_start": 1,
+                "line_end": 2,
+                "text": "正文",
+                "similarity": 0.9,
+            }]
+
+    monkeypatch.setattr(rag, "get_rag_engine", lambda: FakeEngine())
+    monkeypatch.setattr(rag, "get_llm_client", lambda: FakeLLM())
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_REWRITE", True)
+
+    trace = TraceLog(session_id="s")
+    token = rag.current_trace.set(trace)
+    try:
+        asyncio.run(rag.search_docs("我去杭州住一晚能报多少"))
+    finally:
+        rag.current_trace.reset(token)
+
+    rag_steps = [s for s in trace.steps if s.step_type == "rag_retrieve"]
+    assert len(rag_steps) == 1
+    step = rag_steps[0]
+    assert step.rewritten_query == "改写后的检索式"
+    assert step.retrieved_chunks[0]["source"] == "公司考勤与请假制度.md"
+    assert step.retrieved_chunks[0]["similarity"] == 0.9
