@@ -106,14 +106,27 @@ class Settings:
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))
 
-    # 向量检索返回几条结果
-    RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "5"))
+    # 向量召回候选数（Cross-encoder 重排前的候选片段数）
+    RAG_RECALL_TOP_K: int = int(os.getenv("RAG_RECALL_TOP_K", "10"))
+
+    # 最终注入 LLM 上下文的片段数（重排后取前 N 条）
+    RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
 
     # 检索相关性阈值（0~1），低于此值自动切换联网搜索
     RAG_RELEVANCE_THRESHOLD: float = float(os.getenv("RAG_RELEVANCE_THRESHOLD", "0.5"))
 
     # 查询改写开关：用轻量模型把口语化问题改写成检索式，失败自动回退原问题
     RAG_QUERY_REWRITE: bool = os.getenv("RAG_QUERY_REWRITE", "true").lower() in ("1", "true", "yes")
+
+    # Cross-encoder 重排（Qwen Reranker）：未配置 Key 或调用失败时回退余弦顺序
+    RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes")
+    RERANK_API_KEY: str = os.getenv("RERANK_API_KEY", "")
+    RERANK_ENDPOINT: str = os.getenv(
+        "RERANK_ENDPOINT",
+        "https://cn-beijing.maas.qianwenaiapi.com/api/v1/services/rerank/text-rerank/text-rerank",
+    )
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "qwen3.7-text-rerank")
+    RERANK_TIMEOUT: float = float(os.getenv("RERANK_TIMEOUT", "15.0"))
 
     # =====================================================================
     #  七、联网搜索配置
@@ -176,6 +189,8 @@ class Settings:
             errors.append("TOOL_OUTPUT_MAX_CHARS 必须大于 0")
         if self.RAG_TOP_K <= 0:
             errors.append("RAG_TOP_K 必须大于 0")
+        if self.RAG_RECALL_TOP_K <= 0:
+            errors.append("RAG_RECALL_TOP_K 必须大于 0")
         return errors
 
     def require_valid(self) -> None:

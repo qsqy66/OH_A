@@ -150,3 +150,49 @@ def test_search_docs_records_rag_retrieve_trace(monkeypatch):
     assert step.rewritten_query == "改写后的检索式"
     assert step.retrieved_chunks[0]["source"] == "公司考勤与请假制度.md"
     assert step.retrieved_chunks[0]["similarity"] == 0.9
+
+
+def test_rerank_disabled_falls_back(monkeypatch):
+    chunks = [
+        {"text": "a", "similarity": 0.9},
+        {"text": "b", "similarity": 0.8},
+        {"text": "c", "similarity": 0.7},
+    ]
+    monkeypatch.setattr(rag.settings, "RERANK_ENABLED", False)
+    assert asyncio.run(rag._rerank("q", chunks, 2)) == chunks[:2]
+
+
+def test_rerank_reorders_by_model(monkeypatch):
+    chunks = [
+        {"text": "a", "similarity": 0.9},
+        {"text": "b", "similarity": 0.8},
+        {"text": "c", "similarity": 0.7},
+    ]
+    monkeypatch.setattr(rag.settings, "RERANK_ENABLED", True)
+    monkeypatch.setattr(rag.settings, "RERANK_API_KEY", "fake-key")
+    monkeypatch.setattr(
+        rag,
+        "_request_rerank",
+        lambda _q, _d: {"output": {"results": [
+            {"index": 2, "relevance_score": 0.99},
+            {"index": 0, "relevance_score": 0.5},
+            {"index": 1, "relevance_score": 0.3},
+        ]}},
+    )
+    result = asyncio.run(rag._rerank("q", chunks, 2))
+    assert [c["text"] for c in result] == ["c", "a"]
+
+
+def test_rerank_fails_open(monkeypatch):
+    chunks = [
+        {"text": "a", "similarity": 0.9},
+        {"text": "b", "similarity": 0.8},
+    ]
+
+    def boom(_q, _d):
+        raise RuntimeError("network")
+
+    monkeypatch.setattr(rag.settings, "RERANK_ENABLED", True)
+    monkeypatch.setattr(rag.settings, "RERANK_API_KEY", "fake-key")
+    monkeypatch.setattr(rag, "_request_rerank", boom)
+    assert asyncio.run(rag._rerank("q", chunks, 1)) == chunks[:1]

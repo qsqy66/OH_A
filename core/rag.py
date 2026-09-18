@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import numpy as np
 import structlog
@@ -309,6 +311,56 @@ async def _rewrite_query(query: str) -> str:
         return query
 
 
+def _request_rerank(query: str, documents: list[str]) -> dict:
+    payload = json.dumps({
+        "model": settings.RERANK_MODEL,
+        "input": {"query": query, "documents": documents},
+        "parameters": {"top_n": len(documents), "return_documents": True},
+    }).encode("utf-8")
+    request = Request(
+        settings.RERANK_ENDPOINT,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {settings.RERANK_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "office-agent/1.0",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=settings.RERANK_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+async def _rerank(query: str, chunks: list[dict], top_k: int) -> list[dict]:
+    """用 Cross-encoder 重排召回片段；未配置或失败时回退余弦相似度顺序取 top_k。"""
+    if not chunks or top_k <= 0:
+        return []
+    if not settings.RERANK_ENABLED or not settings.RERANK_API_KEY:
+        return chunks[:top_k]
+    try:
+        documents = [chunk["text"] for chunk in chunks]
+        data = await asyncio.to_thread(_request_rerank, query, documents)
+        results = data.get("output", {}).get("results", [])
+        if not results:
+            return chunks[:top_k]
+
+        reranked = []
+        seen = set()
+        for item in results:
+            idx = item.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(chunks) and idx not in seen:
+                reranked.append(chunks[idx])
+                seen.add(idx)
+        # 兜底：补齐 API 未返回的片段（按原余弦顺序）
+        for idx, chunk in enumerate(chunks):
+            if idx not in seen:
+                reranked.append(chunk)
+        return reranked[:top_k]
+    except Exception as exc:
+        logger.warning("rag_rerank_failed", error=str(exc))
+        return chunks[:top_k]
+
+
 async def search_docs(query: str, top_k: int | None = None) -> str:
     engine = get_rag_engine()
     if not engine.chunks:
@@ -317,7 +369,9 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
             return "知识库为空：请把文档放到 docs 目录下，然后重试。"
 
     search_query = await _rewrite_query(query)
-    results = await engine.retrieve(search_query, top_k)
+    final_k = top_k or settings.RAG_TOP_K
+    recall_results = await engine.retrieve(search_query, settings.RAG_RECALL_TOP_K)
+    results = await _rerank(search_query, recall_results, final_k)
 
     trace = current_trace.get()
     if trace is not None:

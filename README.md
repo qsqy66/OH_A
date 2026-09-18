@@ -46,6 +46,8 @@ python main.py
 
 检索前会先用轻量模型对口语化问题做**查询改写**（补全关键词、保留专有名词与数字），提升语义检索命中率；改写失败会自动回退原问题。可用 `RAG_QUERY_REWRITE=false` 关闭。
 
+检索采用**两段式**：向量召回 Top-10 候选，再用 Cross-encoder 重排（Qwen Reranker）精排后取 Top-3 注入 LLM 上下文；未配置 `RERANK_API_KEY` 或重排失败时自动回退余弦相似度顺序。召回数由 `RAG_RECALL_TOP_K`、最终数由 `RAG_TOP_K` 控制。
+
 输入 `1` 进入多轮对话，输入 `2` 根据 Trace ID 查询调用链，输入 `3` 增量更新本地知识库索引（新增、修改或重命名 `docs/` 下的文档后使用）；输入 `exit`、`quit` 或 `不聊了`退出。
 
 ### 4. 启动 HTTP API
@@ -90,15 +92,25 @@ python -m pytest -q
 python evals/run_rag_eval.py
 ```
 
-脚本输出五类指标：
+脚本输出两段式指标：
 
-- `retrieval_hit_rate`：期望来源是否进入 top-k 检索结果（命中率）；
-- `retrieval_recall`：标注相关片段被检索到的比例（召回率，来源级或片段级）；
-- `retrieval_mrr`：首个相关结果的排名倒数均值；
+**召回阶段**（重排前，衡量检索召回能力，取 `RAG_RECALL_TOP_K` 候选）：
+
+- `recall_hit_rate`：相关来源是否进入召回 Top-N（命中率）；
+- `recall_rate`：标注相关片段被召回的比例（召回率，来源级或片段级）；
+- `recall_mrr`：首个相关来源排名的倒数均值。
+
+**重排后**（衡量 Cross-encoder 重排收益，取 `RAG_TOP_K` 最终片段）：
+
+- `rerank_hit_rate`：相关来源是否进入重排后的最终 Top-N；
+- `rerank_precision`：最终 Top-N 里相关来源片段的占比。
+
+**生成质量**：
+
 - `answer_keyword_accuracy`：回答是否命中预设关键词（快速回归项）；
 - `faithfulness`：回答忠诚度，RAGAS 式 LLM-as-judge（拆论断 → 逐条核验是否被检索资料支持）。
 
-忠诚度评测会额外调用轻量模型，想省 API 调用可加 `--no-faithfulness` 跳过；每个问题的论断级核验明细在输出的 `details[].claims` 中，便于人工抽查。
+忠诚度评测会额外调用轻量模型，想省 API 调用可加 `--no-faithfulness` 跳过；每个问题的论断级核验明细在输出的 `details[].claims` 中，便于人工抽查。重排需配置 `RERANK_API_KEY`，未配置时自动回退余弦顺序（此时 rerank 指标等价于召回阶段截断）。
 
 ## 配置校验
 

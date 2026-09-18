@@ -13,7 +13,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from config import settings
 from core.llm_client import get_llm_client
-from core.rag import get_rag_engine
+from core.rag import get_rag_engine, _rerank
 
 
 ROOT = Path(__file__).parent
@@ -145,9 +145,11 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
         await engine.index_documents()
 
     llm = get_llm_client()
-    hit_count = 0
+    recall_hit_count = 0
     recall_sum = 0.0
-    mrr_sum = 0.0
+    recall_mrr_sum = 0.0
+    rerank_hit_count = 0
+    rerank_precision_sum = 0.0
     keyword_hits = 0
     keyword_total = 0
     faithfulness_sum = 0.0
@@ -155,38 +157,47 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
     details = []
 
     for question in questions:
-        results = await engine.retrieve(question["query"], settings.RAG_TOP_K)
-        sources = [item["source"] for item in results]
+        query = question["query"]
         relevant = _relevant_sources(question)
 
-        # 命中率 Hit@k：相关来源是否进入 top-k
-        retrieval_hit = bool(set(sources) & relevant)
-        hit_count += int(retrieval_hit)
+        # 1) 召回阶段：向量检索 Top-N（重排前，衡量召回能力）
+        recall_results = await engine.retrieve(query, settings.RAG_RECALL_TOP_K)
+        recall_sources = [item["source"] for item in recall_results]
 
-        # 召回率 Recall@k：优先按标注的 relevant_chunks 片段级计算，否则按来源级
-        chunk_recall = _chunk_recall(results, question)
-        recall = chunk_recall if chunk_recall is not None else _source_recall(sources, relevant)
+        recall_hit = bool(set(recall_sources) & relevant)
+        recall_hit_count += int(recall_hit)
+
+        chunk_recall = _chunk_recall(recall_results, question)
+        recall = chunk_recall if chunk_recall is not None else _source_recall(recall_sources, relevant)
         recall_sum += recall
 
-        # MRR：首个相关来源排名的倒数
-        first_rank = next((i + 1 for i, s in enumerate(sources) if s in relevant), None)
-        mrr_sum += 1.0 / first_rank if first_rank else 0.0
+        recall_first_rank = next((i + 1 for i, s in enumerate(recall_sources) if s in relevant), None)
+        recall_mrr_sum += 1.0 / recall_first_rank if recall_first_rank else 0.0
 
-        context = build_context(results)
+        # 2) 重排阶段：Cross-encoder 精排取最终 Top-K（衡量重排收益）
+        final_results = await _rerank(query, recall_results, settings.RAG_TOP_K)
+        final_sources = [item["source"] for item in final_results]
+
+        rerank_hit = bool(set(final_sources) & relevant)
+        rerank_hit_count += int(rerank_hit)
+
+        precision = sum(1 for s in final_sources if s in relevant) / len(final_sources) if final_sources else 0.0
+        rerank_precision_sum += precision
+
+        # 3) 用重排后的最终片段生成回答并评估质量
+        context = build_context(final_results)
         answer = await llm.lite_chat(
             "只根据提供的资料回答问题。不要编造；只输出答案正文。",
-            f"问题：{question['query']}\n资料：\n{context}",
+            f"问题：{query}\n资料：\n{context}",
         )
         answer_text = answer or ""
 
-        # 关键词准确性：快速回归项，仅统计标注了关键词的问题
         expected_keywords = question.get("expected_keywords") or []
         answer_hit = all(_norm(k) in _norm(answer_text) for k in expected_keywords) if expected_keywords else None
         if expected_keywords:
             keyword_total += 1
             keyword_hits += int(answer_hit)
 
-        # 忠诚度 LLM-as-judge
         faithfulness_result = None
         if with_faithfulness:
             faithfulness_result = await evaluate_faithfulness(llm, answer_text, context)
@@ -196,22 +207,30 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
 
         details.append({
             "id": question["id"],
-            "retrieval_hit": retrieval_hit,
-            "retrieval_recall": round(recall, 4),
-            "first_rank": first_rank,
+            "recall_hit": recall_hit,
+            "recall": round(recall, 4),
+            "recall_first_rank": recall_first_rank,
+            "rerank_hit": rerank_hit,
+            "rerank_precision": round(precision, 4),
             "answer_keyword_hit": answer_hit,
             "faithfulness": faithfulness_result["faithfulness"] if faithfulness_result else None,
             "claims": faithfulness_result["claims"] if faithfulness_result else [],
-            "sources": sources,
+            "recall_sources": recall_sources,
+            "final_sources": final_sources,
         })
 
     total = len(questions)
     return {
         "dataset": str(path),
         "total": total,
-        "retrieval_hit_rate": round(hit_count / total, 4) if total else 0.0,
-        "retrieval_recall": round(recall_sum / total, 4) if total else 0.0,
-        "retrieval_mrr": round(mrr_sum / total, 4) if total else 0.0,
+        # 召回阶段（重排前，衡量检索召回能力）
+        "recall_hit_rate": round(recall_hit_count / total, 4) if total else 0.0,
+        "recall_rate": round(recall_sum / total, 4) if total else 0.0,
+        "recall_mrr": round(recall_mrr_sum / total, 4) if total else 0.0,
+        # 重排后（最终注入 LLM，衡量重排收益）
+        "rerank_hit_rate": round(rerank_hit_count / total, 4) if total else 0.0,
+        "rerank_precision": round(rerank_precision_sum / total, 4) if total else 0.0,
+        # 生成质量
         "answer_keyword_accuracy": round(keyword_hits / keyword_total, 4) if keyword_total else None,
         "faithfulness": round(faithfulness_sum / faithfulness_count, 4) if faithfulness_count else None,
         "details": details,
@@ -219,7 +238,7 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="评测本地知识库检索命中率/召回率/MRR与回答忠诚度")
+    parser = argparse.ArgumentParser(description="评测 RAG：召回(hit/recall/MRR) + 重排(hit/precision) + 回答质量")
     parser.add_argument("--dataset", type=Path, default=ROOT / "rag_questions.jsonl")
     parser.add_argument("--no-faithfulness", action="store_true", help="跳过 LLM-as-judge 忠诚度评测，省 API 调用")
     args = parser.parse_args()
