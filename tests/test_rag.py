@@ -33,17 +33,31 @@ class FakeEmbedLLM:
         return [[0.1] * 8 for _ in texts]
 
 
-def _chunk(source, sha, version="2026-10-20 10:00:00"):
+def _child(source, sha, parent_id=None, version="2026-10-20 10:00:00"):
     return {
-        "id": f"{source}:{sha}:0",
+        "id": f"{sha}:child:0",
+        "parent_id": parent_id or f"{sha}:parent:0",
         "source": source,
         "sha256": sha,
         "version": version,
         "page": "N/A",
         "line_start": 1,
         "line_end": 1,
-        "text": "正文",
+        "text": "子块正文",
         "embedding": [0.0] * 8,
+    }
+
+
+def _parent(source, sha, version="2026-10-20 10:00:00"):
+    return {
+        "id": f"{sha}:parent:0",
+        "source": source,
+        "sha256": sha,
+        "version": version,
+        "page": "N/A",
+        "line_start": 1,
+        "line_end": 2,
+        "text": "父块正文",
     }
 
 
@@ -57,9 +71,14 @@ def test_index_documents_incremental(monkeypatch):
     ]
     engine = rag.RAGEngine.__new__(rag.RAGEngine)
     engine.chunks = [
-        _chunk("a.md", "sha_a"),
-        _chunk("b.md", "sha_b1"),
-        _chunk("old_c.md", "sha_c"),
+        _child("a.md", "sha_a"),
+        _child("b.md", "sha_b1"),
+        _child("old_c.md", "sha_c"),
+    ]
+    engine.parents = [
+        _parent("a.md", "sha_a"),
+        _parent("b.md", "sha_b1"),
+        _parent("old_c.md", "sha_c"),
     ]
     monkeypatch.setattr(engine, "_save", lambda: None)
     fake = FakeEmbedLLM()
@@ -71,6 +90,7 @@ def test_index_documents_incremental(monkeypatch):
     # 只有 b（更新）和 d（新增）需要重新向量化；a（未变）、c（改名）不需要
     assert fake.embed_calls == 2
     assert {c["source"] for c in engine.chunks} == {"a.md", "b.md", "c_新名.md", "d.md"}
+    assert {p["source"] for p in engine.parents} == {"a.md", "b.md", "c_新名.md", "d.md"}
 
     a = next(c for c in engine.chunks if c["source"] == "a.md")
     assert a["version"] == "2026-10-20 10:00:00"  # 未变，版本不变
@@ -120,18 +140,33 @@ def test_search_docs_records_rag_retrieve_trace(monkeypatch):
 
     class FakeEngine:
         chunks = [{"source": "x"}]
+        parents = [{
+            "id": "p1",
+            "source": "公司考勤与请假制度.md",
+            "sha256": "abc123",
+            "version": "2026-08-27 19:36:13",
+            "page": "N/A",
+            "line_start": 1,
+            "line_end": 2,
+            "text": "父块正文",
+        }]
 
         async def retrieve(self, _query, _top_k=None):
             return [{
+                "id": "c1",
+                "parent_id": "p1",
                 "source": "公司考勤与请假制度.md",
                 "sha256": "abc123",
                 "version": "2026-08-27 19:36:13",
                 "page": "N/A",
                 "line_start": 1,
                 "line_end": 2,
-                "text": "正文",
+                "text": "子块正文",
                 "similarity": 0.9,
             }]
+
+        def resolve_parents(self, _child_chunks):
+            return [dict(self.parents[0], similarity=0.9)]
 
     monkeypatch.setattr(rag, "get_rag_engine", lambda: FakeEngine())
     monkeypatch.setattr(rag, "get_llm_client", lambda: FakeLLM())
@@ -196,3 +231,34 @@ def test_rerank_fails_open(monkeypatch):
     monkeypatch.setattr(rag.settings, "RERANK_API_KEY", "fake-key")
     monkeypatch.setattr(rag, "_request_rerank", boom)
     assert asyncio.run(rag._rerank("q", chunks, 1)) == chunks[:1]
+
+
+def test_split_parents_merges_paragraphs_no_overlap():
+    text = "第一段。\n\n第二段。\n\n第三段。"
+    assert rag._split_parents(text, 100) == ["第一段。\n\n第二段。\n\n第三段。"]
+
+
+def test_split_parents_splits_when_over_limit():
+    # 每段 2 token，max=4 只放得下两段
+    assert rag._split_parents("甲。\n\n乙。\n\n丙。", 4) == ["甲。\n\n乙。", "丙。"]
+
+
+def test_split_children_sentence_based_with_overlap():
+    # 每句 2 token，max=4、overlap 25% → 相邻子块共享尾部一个句
+    assert rag._split_children("甲。乙。丙。丁。戊。", 4, 0.25) == ["甲。乙。", "乙。丙。", "丙。丁。", "丁。戊。"]
+
+
+def test_resolve_parents_dedup():
+    engine = rag.RAGEngine.__new__(rag.RAGEngine)
+    engine.parents = [
+        {"id": "sha:p:0", "source": "a.md", "text": "A", "version": "v", "page": "N/A", "line_start": 1, "line_end": 1, "sha256": "sha"},
+        {"id": "sha:p:1", "source": "b.md", "text": "B", "version": "v", "page": "N/A", "line_start": 1, "line_end": 1, "sha256": "sha"},
+    ]
+    children = [
+        {"parent_id": "sha:p:0", "similarity": 0.9},
+        {"parent_id": "sha:p:0", "similarity": 0.7},  # 重复父块
+        {"parent_id": "sha:p:1", "similarity": 0.8},
+    ]
+    resolved = engine.resolve_parents(children)
+    assert [p["source"] for p in resolved] == ["a.md", "b.md"]  # 去重
+    assert resolved[0]["similarity"] == 0.9  # 取最大子块相似度

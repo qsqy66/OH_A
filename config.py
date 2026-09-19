@@ -102,9 +102,14 @@ class Settings:
     VECTOR_PERSIST_DIR: str = os.getenv("VECTOR_PERSIST_DIR", "./vector_data")
     VECTOR_COLLECTION: str = os.getenv("VECTOR_COLLECTION", "office_docs")
 
-    # 文本分块：每块字符数 / 相邻块重叠字符数
+    # 文本分块（旧版简单分块，已被父子切块取代，保留兼容）
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))
+
+    # 父子切块：父块（段落/页码级，无 overlap、不向量化）/ 子块（句级、向量化、关联父块）
+    PARENT_CHUNK_TOKENS: int = int(os.getenv("PARENT_CHUNK_TOKENS", "2500"))
+    CHILD_CHUNK_TOKENS: int = int(os.getenv("CHILD_CHUNK_TOKENS", "150"))
+    CHILD_CHUNK_OVERLAP: float = float(os.getenv("CHILD_CHUNK_OVERLAP", "0.25"))
 
     # 向量召回候选数（Cross-encoder 重排前的候选片段数）
     RAG_RECALL_TOP_K: int = int(os.getenv("RAG_RECALL_TOP_K", "10"))
@@ -183,6 +188,12 @@ class Settings:
             errors.append("CHUNK_SIZE 必须大于 0")
         if not 0 <= self.CHUNK_OVERLAP < self.CHUNK_SIZE:
             errors.append("CHUNK_OVERLAP 必须大于等于 0 且小于 CHUNK_SIZE")
+        if self.PARENT_CHUNK_TOKENS <= 0:
+            errors.append("PARENT_CHUNK_TOKENS 必须大于 0")
+        if self.CHILD_CHUNK_TOKENS <= 0:
+            errors.append("CHILD_CHUNK_TOKENS 必须大于 0")
+        if not 0 <= self.CHILD_CHUNK_OVERLAP < 1:
+            errors.append("CHILD_CHUNK_OVERLAP 必须大于等于 0 且小于 1")
         if self.TOOL_TIMEOUT <= 0:
             errors.append("TOOL_TIMEOUT 必须大于 0")
         if self.TOOL_OUTPUT_MAX_CHARS <= 0:

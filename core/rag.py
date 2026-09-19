@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -108,6 +109,83 @@ def _chunk_metadata(text: str, pieces: list[str]) -> list[dict]:
     return metadata
 
 
+def _count_tokens(text: str) -> int:
+    """粗略估算 token 数：本项目文档以中文为主，按 1 字符 ≈ 1 token 计。"""
+    return len(text)
+
+
+_SENTENCE_END = "。！？；!?;"
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按句末标点拆句，标点保留在句尾。"""
+    sentences = []
+    start = 0
+    for index, ch in enumerate(text):
+        if ch in _SENTENCE_END:
+            sentences.append(text[start:index + 1])
+            start = index + 1
+    if start < len(text):
+        sentences.append(text[start:])
+    return [s for s in sentences if s.strip()]
+
+
+def _tail_sentences(sentences: list[str], keep_chars: int) -> list[str]:
+    """从句子列表尾部保留约 keep_chars 个字符（按整句截取），用于子块 overlap。"""
+    tail = []
+    remaining = keep_chars
+    for sent in reversed(sentences):
+        if remaining <= 0:
+            break
+        tail.insert(0, sent)
+        remaining -= _count_tokens(sent)
+    return tail
+
+
+def _split_children(parent_text: str, max_tokens: int, overlap_ratio: float) -> list[str]:
+    """在父块内按句切子块，最大 max_tokens，overlap = 子块长度 * overlap_ratio，不越父块边界。"""
+    sentences = _split_sentences(parent_text)
+    if not sentences:
+        return []
+    children = []
+    buf = []
+    buf_len = 0
+    for sent in sentences:
+        slen = _count_tokens(sent)
+        if buf and buf_len + slen > max_tokens:
+            children.append("".join(buf))
+            keep = int(buf_len * overlap_ratio)
+            buf = _tail_sentences(buf, keep)
+            buf_len = _count_tokens("".join(buf))
+        buf.append(sent)
+        buf_len += slen
+    if buf:
+        children.append("".join(buf))
+    return children
+
+
+def _split_parents(text: str, max_tokens: int) -> list[str]:
+    """按空行段落合并成父块，尽量不超过 max_tokens，父块之间无重叠。"""
+    paragraphs = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    parents = []
+    buf = []
+    buf_len = 0
+    for para in paragraphs:
+        plen = _count_tokens(para)
+        if buf and buf_len + plen > max_tokens:
+            parents.append("\n\n".join(buf))
+            buf, buf_len = [], 0
+        if plen > max_tokens:
+            # 单个段落超长，按句硬切成多个父块（无重叠）
+            parents.extend(_split_children(para, max_tokens, 0.0))
+            continue
+        buf.append(para)
+        buf_len += plen
+    if buf:
+        parents.append("\n\n".join(buf))
+    return parents
+
+
 def cosine_similarity(a, b) -> float:
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -120,7 +198,8 @@ def cosine_similarity(a, b) -> float:
 
 class RAGEngine:
     def __init__(self):
-        self.chunks: list[dict] = []
+        self.chunks: list[dict] = []   # 子块（有 embedding，含 parent_id）
+        self.parents: list[dict] = []  # 父块（无 embedding，存溯源元数据与全文）
         self._persist_dir = Path(settings.VECTOR_PERSIST_DIR)
         self._persist_file = self._persist_dir / f"{settings.VECTOR_COLLECTION}.json"
         self._load()
@@ -129,42 +208,71 @@ class RAGEngine:
         if not self._persist_file.exists():
             return
         try:
-            self.chunks = json.loads(self._persist_file.read_text(encoding="utf-8"))
-            logger.info("rag_index_loaded", count=len(self.chunks), backend="json")
+            data = json.loads(self._persist_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self.chunks = data.get("chunks", [])
+                self.parents = data.get("parents", [])
+            else:
+                # 旧格式：只有 chunks 列表，无父块
+                self.chunks = data
+                self.parents = []
+            logger.info("rag_index_loaded", chunks=len(self.chunks), parents=len(self.parents), backend="json")
         except Exception as exc:
             logger.error("rag_index_load_error", error=str(exc))
             self.chunks = []
+            self.parents = []
 
     def _save(self) -> None:
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._persist_file.write_text(
-            json.dumps(self.chunks, ensure_ascii=False),
+            json.dumps({"chunks": self.chunks, "parents": self.parents}, ensure_ascii=False),
             encoding="utf-8",
         )
 
-    async def _embed_doc(self, llm, doc: dict, version: str) -> list[dict]:
-        pieces = chunk_text(doc["text"], settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
-        positions = _chunk_metadata(doc["text"], pieces)
-        embeddings = await llm.embed_texts(pieces)
-        chunks = []
-        for index, (piece, vector, position) in enumerate(zip(pieces, embeddings, positions)):
-            chunks.append({
-                "id": f"{doc['source']}:{doc['sha256']}:{index}",
+    async def _embed_doc(self, llm, doc: dict, version: str) -> tuple[list[dict], list[dict]]:
+        """把文档切成父子块：父块不向量化，子块向量化并关联父块 ID。"""
+        parent_texts = _split_parents(doc["text"], settings.PARENT_CHUNK_TOKENS)
+        parent_meta = _chunk_metadata(doc["text"], parent_texts)
+
+        children: list[dict] = []
+        parents: list[dict] = []
+        child_index = 0
+        for p_idx, (p_text, p_meta) in enumerate(zip(parent_texts, parent_meta)):
+            parent_id = f"{doc['sha256']}:parent:{p_idx}"
+            parents.append({
+                "id": parent_id,
                 "source": doc["source"],
                 "sha256": doc["sha256"],
                 "version": version,
-                "page": position["page"],
-                "line_start": position["line_start"],
-                "line_end": position["line_end"],
-                "text": piece,
-                "embedding": [float(value) for value in vector],
+                "page": p_meta["page"],
+                "line_start": p_meta["line_start"],
+                "line_end": p_meta["line_end"],
+                "text": p_text,
             })
-        return chunks
+
+            child_texts = _split_children(p_text, settings.CHILD_CHUNK_TOKENS, settings.CHILD_CHUNK_OVERLAP)
+            child_meta = _chunk_metadata(p_text, child_texts)
+            embeddings = await llm.embed_texts(child_texts)
+            for c_idx, (c_text, c_meta, vector) in enumerate(zip(child_texts, child_meta, embeddings)):
+                children.append({
+                    "id": f"{doc['sha256']}:child:{child_index}",
+                    "parent_id": parent_id,
+                    "source": doc["source"],
+                    "sha256": doc["sha256"],
+                    "version": version,
+                    "page": c_meta["page"],
+                    "line_start": p_meta["line_start"] + c_meta["line_start"] - 1,
+                    "line_end": p_meta["line_start"] + c_meta["line_end"] - 1,
+                    "text": c_text,
+                    "embedding": [float(value) for value in vector],
+                })
+                child_index += 1
+        return children, parents
 
     async def index_documents(self, force: bool = False) -> dict:
-        """按「文件名 + SHA256」增量更新向量库。
+        """按「文件名 + SHA256」增量更新向量库（父子块）。
 
-        返回 {"indexed_chunks": 总片段数, "events": [人类可读的变更提示]}。
+        返回 {"indexed_chunks": 子块总数, "events": [人类可读的变更提示]}。
 
         - 文件名与 SHA256 都不变 → 内容未变，不重新向量化，版本不变；
         - 文件名不变、SHA256 变 → 内容更新，重新向量化，版本设为当前时间；
@@ -175,26 +283,32 @@ class RAGEngine:
         docs = load_documents(settings.DOCS_DIR)
         if not docs:
             self.chunks = []
+            self.parents = []
             self._save()
             return {"indexed_chunks": 0, "events": ["知识库为空：docs 目录下没有可入库的文档。"]}
 
         if force:
             return await self._full_reindex(docs)
 
-        # 只保留带 sha256 的片段（旧索引无 sha256，会被当作新文件重新入库）
-        existing_by_source: dict[str, list[dict]] = {}
+        existing_children_by_source: dict[str, list[dict]] = {}
         for chunk in self.chunks:
             if "sha256" not in chunk:
                 continue
-            existing_by_source.setdefault(chunk["source"], []).append(chunk)
+            existing_children_by_source.setdefault(chunk["source"], []).append(chunk)
+        existing_parents_by_source: dict[str, list[dict]] = {}
+        for parent in self.parents:
+            if "sha256" not in parent:
+                continue
+            existing_parents_by_source.setdefault(parent["source"], []).append(parent)
         existing_sha_by_source = {
             source: chunks[0]["sha256"]
-            for source, chunks in existing_by_source.items()
+            for source, chunks in existing_children_by_source.items()
             if chunks
         }
 
         llm = get_llm_client()
-        new_chunks: list[dict] = []
+        new_children: list[dict] = []
+        new_parents: list[dict] = []
         events: list[str] = []
         claimed: set[str] = set()
 
@@ -203,15 +317,18 @@ class RAGEngine:
             sha = doc["sha256"]
 
             # 1) 文件名与 SHA256 都不变 → 内容未变
-            if source in existing_by_source and existing_sha_by_source.get(source) == sha:
-                new_chunks.extend(existing_by_source[source])
+            if source in existing_children_by_source and existing_sha_by_source.get(source) == sha:
+                new_children.extend(existing_children_by_source[source])
+                new_parents.extend(existing_parents_by_source.get(source, []))
                 claimed.add(source)
                 continue
 
             # 2) 文件名不变但 SHA256 变 → 内容更新
-            if source in existing_by_source:
+            if source in existing_children_by_source:
                 version = _now_version()
-                new_chunks.extend(await self._embed_doc(llm, doc, version))
+                children, parents = await self._embed_doc(llm, doc, version)
+                new_children.extend(children)
+                new_parents.extend(parents)
                 claimed.add(source)
                 events.append(f"文件更新：{source}（版本 {version}）")
                 continue
@@ -223,45 +340,56 @@ class RAGEngine:
             ]
             if rename_candidates:
                 old = rename_candidates[0]
-                for chunk in existing_by_source[old]:
+                for chunk in existing_children_by_source[old]:
                     renamed = dict(chunk)
                     renamed["source"] = source
-                    renamed["id"] = f"{source}:{sha}:{renamed['id'].rsplit(':', 1)[-1]}"
-                    new_chunks.append(renamed)
+                    new_children.append(renamed)
+                for parent in existing_parents_by_source.get(old, []):
+                    renamed = dict(parent)
+                    renamed["source"] = source
+                    new_parents.append(renamed)
                 claimed.add(old)
                 events.append(f"文件名变更：{old} → {source}")
                 continue
 
             # 4) 全新文件
             version = _now_version()
-            new_chunks.extend(await self._embed_doc(llm, doc, version))
+            children, parents = await self._embed_doc(llm, doc, version)
+            new_children.extend(children)
+            new_parents.extend(parents)
             events.append(f"新增文件：{source}（版本 {version}）")
 
         # 5) 删除检测：旧索引里未被认领的来源
-        for old in existing_by_source:
+        for old in existing_children_by_source:
             if old not in claimed:
                 events.append(f"文件已删除：{old}")
 
-        self.chunks = new_chunks
+        self.chunks = new_children
+        self.parents = new_parents
         self._save()
-        logger.info("rag_indexed", chunks=len(self.chunks), backend="json", events=len(events))
+        logger.info("rag_indexed", chunks=len(self.chunks), parents=len(self.parents), backend="json", events=len(events))
         return {"indexed_chunks": len(self.chunks), "events": events}
 
     async def _full_reindex(self, docs: list[dict]) -> dict:
         llm = get_llm_client()
         version = _now_version()
-        new_chunks = []
+        new_children = []
+        new_parents = []
         for doc in docs:
-            new_chunks.extend(await self._embed_doc(llm, doc, version))
-        self.chunks = new_chunks
+            children, parents = await self._embed_doc(llm, doc, version)
+            new_children.extend(children)
+            new_parents.extend(parents)
+        self.chunks = new_children
+        self.parents = new_parents
         self._save()
-        logger.info("rag_reindexed", chunks=len(self.chunks), backend="json")
+        logger.info("rag_reindexed", chunks=len(self.chunks), parents=len(self.parents), backend="json")
         return {
             "indexed_chunks": len(self.chunks),
             "events": [f"全量重建：{len(docs)} 个文件，版本 {version}"],
         }
 
     async def retrieve(self, query: str, top_k: int | None = None) -> list[dict]:
+        """对子块做向量召回，返回 top_k 个子块（含 parent_id 与相似度）。"""
         top_k = top_k or settings.RAG_TOP_K
         if not self.chunks:
             return []
@@ -275,6 +403,22 @@ class RAGEngine:
             })
         results.sort(key=lambda item: item["similarity"], reverse=True)
         return results[:top_k]
+
+    def resolve_parents(self, child_chunks: list[dict]) -> list[dict]:
+        """把召回的父块映射回父块并去重，返回父块（附带其子块最大相似度）。"""
+        parent_by_id = {parent["id"]: parent for parent in self.parents}
+        resolved = []
+        seen = set()
+        for child in child_chunks:
+            pid = child.get("parent_id")
+            if pid is None or pid in seen:
+                continue
+            parent = parent_by_id.get(pid)
+            if parent is None:
+                continue
+            seen.add(pid)
+            resolved.append({**parent, "similarity": child.get("similarity", 0.0)})
+        return resolved
 
     async def close(self) -> None:
         return None
@@ -370,8 +514,9 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
 
     search_query = await _rewrite_query(query)
     final_k = top_k or settings.RAG_TOP_K
-    recall_results = await engine.retrieve(search_query, settings.RAG_RECALL_TOP_K)
-    results = await _rerank(search_query, recall_results, final_k)
+    child_results = await engine.retrieve(search_query, settings.RAG_RECALL_TOP_K)
+    parents = engine.resolve_parents(child_results)
+    results = await _rerank(search_query, parents, final_k)
 
     trace = current_trace.get()
     if trace is not None:
@@ -385,7 +530,7 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
                     "version": item["version"],
                     "line_start": item["line_start"],
                     "line_end": item["line_end"],
-                    "similarity": item["similarity"],
+                    "similarity": item.get("similarity"),
                 }
                 for item in results
             ],
@@ -400,6 +545,6 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
         lines.append(
             f"\n[片段{index}] 来源：{result['source']}（版本：{result['version']}，"
             f"页码：{result['page']}，{location}）"
-            f"\n相关度：{result['similarity']}\n{result['text']}"
+            f"\n相关度：{result.get('similarity', '')}\n{result['text']}"
         )
     return "\n".join(lines)

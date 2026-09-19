@@ -45,7 +45,7 @@ async def main():
         await reindex_knowledge()
     else:
         agent = AgentLoop()
-        session_id = "text_1"
+        session_id = "text_2"
         while(True):
             query = input("请输入问题：")
             if query == "exit" or query == "quit" or query == "不聊了":

@@ -174,8 +174,9 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
         recall_first_rank = next((i + 1 for i, s in enumerate(recall_sources) if s in relevant), None)
         recall_mrr_sum += 1.0 / recall_first_rank if recall_first_rank else 0.0
 
-        # 2) 重排阶段：Cross-encoder 精排取最终 Top-K（衡量重排收益）
-        final_results = await _rerank(query, recall_results, settings.RAG_TOP_K)
+        # 2) 重排阶段：子块映射回父块去重后，Cross-encoder 精排父块取最终 Top-K（衡量重排收益）
+        parents = engine.resolve_parents(recall_results)
+        final_results = await _rerank(query, parents, settings.RAG_TOP_K)
         final_sources = [item["source"] for item in final_results]
 
         rerank_hit = bool(set(final_sources) & relevant)
