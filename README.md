@@ -105,7 +105,7 @@ python evals/run_rag_eval.py
 **重排后**（衡量 Cross-encoder 重排收益，取 `RAG_TOP_K` 最终片段）：
 
 - `rerank_hit_rate`：相关来源是否进入重排后的最终 Top-N；
-- `rerank_precision`：最终 Top-N 里相关来源片段的占比。
+- `rerank_loss_rate`：召回找到的相关来源里，重排后丢失的比例（越低越好，0 = 无丢失）。
 
 **生成质量**：
 

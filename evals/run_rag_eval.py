@@ -149,7 +149,8 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
     recall_sum = 0.0
     recall_mrr_sum = 0.0
     rerank_hit_count = 0
-    rerank_precision_sum = 0.0
+    rerank_loss_sum = 0.0
+    rerank_loss_count = 0
     keyword_hits = 0
     keyword_total = 0
     faithfulness_sum = 0.0
@@ -182,8 +183,14 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
         rerank_hit = bool(set(final_sources) & relevant)
         rerank_hit_count += int(rerank_hit)
 
-        precision = sum(1 for s in final_sources if s in relevant) / len(final_sources) if final_sources else 0.0
-        rerank_precision_sum += precision
+        # 重排丢失率：召回找到的相关来源里，重排后丢掉了多少（越低越好，0 = 无丢失）
+        recall_relevant = set(p["source"] for p in parents) & relevant
+        recall_relevant_count = len(recall_relevant)
+        final_relevant_count = len(set(final_sources) & relevant)
+        loss = (recall_relevant_count - final_relevant_count) / recall_relevant_count if recall_relevant_count else None
+        if loss is not None:
+            rerank_loss_sum += loss
+            rerank_loss_count += 1
 
         # 3) 用重排后的最终片段生成回答并评估质量
         context = build_context(final_results)
@@ -212,7 +219,7 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
             "recall": round(recall, 4),
             "recall_first_rank": recall_first_rank,
             "rerank_hit": rerank_hit,
-            "rerank_precision": round(precision, 4),
+            "rerank_loss": round(loss, 4) if loss is not None else None,
             "answer_keyword_hit": answer_hit,
             "faithfulness": faithfulness_result["faithfulness"] if faithfulness_result else None,
             "claims": faithfulness_result["claims"] if faithfulness_result else [],
@@ -230,7 +237,7 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
         "recall_mrr": round(recall_mrr_sum / total, 4) if total else 0.0,
         # 重排后（最终注入 LLM，衡量重排收益）
         "rerank_hit_rate": round(rerank_hit_count / total, 4) if total else 0.0,
-        "rerank_precision": round(rerank_precision_sum / total, 4) if total else 0.0,
+        "rerank_loss_rate": round(rerank_loss_sum / rerank_loss_count, 4) if rerank_loss_count else None,
         # 生成质量
         "answer_keyword_accuracy": round(keyword_hits / keyword_total, 4) if keyword_total else None,
         "faithfulness": round(faithfulness_sum / faithfulness_count, 4) if faithfulness_count else None,
@@ -239,7 +246,7 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="评测 RAG：召回(hit/recall/MRR) + 重排(hit/precision) + 回答质量")
+    parser = argparse.ArgumentParser(description="评测 RAG：召回(hit/recall/MRR) + 重排(hit/loss) + 回答质量")
     parser.add_argument("--dataset", type=Path, default=ROOT / "rag_questions.jsonl")
     parser.add_argument("--no-faithfulness", action="store_true", help="跳过 LLM-as-judge 忠诚度评测，省 API 调用")
     args = parser.parse_args()
