@@ -198,36 +198,128 @@ def cosine_similarity(a, b) -> float:
 
 class RAGEngine:
     def __init__(self):
-        self.chunks: list[dict] = []   # 子块（有 embedding，含 parent_id）
-        self.parents: list[dict] = []  # 父块（无 embedding，存溯源元数据与全文）
-        self._persist_dir = Path(settings.VECTOR_PERSIST_DIR)
-        self._persist_file = self._persist_dir / f"{settings.VECTOR_COLLECTION}.json"
-        self._load()
+        # Milvus 懒连接：真正用到向量库时才 import pymilvus 并连接，避免无依赖时 import/实例化即失败
+        self._client = None
 
-    def _load(self) -> None:
-        if not self._persist_file.exists():
-            return
-        try:
-            data = json.loads(self._persist_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                self.chunks = data.get("chunks", [])
-                self.parents = data.get("parents", [])
-            else:
-                # 旧格式：只有 chunks 列表，无父块
-                self.chunks = data
-                self.parents = []
-            logger.info("rag_index_loaded", chunks=len(self.chunks), parents=len(self.parents), backend="json")
-        except Exception as exc:
-            logger.error("rag_index_load_error", error=str(exc))
-            self.chunks = []
-            self.parents = []
+    # —— Milvus 基础操作 ——
 
-    def _save(self) -> None:
-        self._persist_dir.mkdir(parents=True, exist_ok=True)
-        self._persist_file.write_text(
-            json.dumps({"chunks": self.chunks, "parents": self.parents}, ensure_ascii=False),
-            encoding="utf-8",
+    def _get_client(self):
+        if self._client is None:
+            from pymilvus import MilvusClient
+            uri = settings.MILVUS_URI
+            # Milvus Lite（本地文件 URI）要求目录已存在，先创建
+            if not uri.startswith(("http://", "https://")):
+                Path(uri).parent.mkdir(parents=True, exist_ok=True)
+            self._client = MilvusClient(uri=uri)
+        return self._client
+
+    def _ensure_collections(self, dim: int) -> None:
+        from pymilvus import DataType
+        client = self._get_client()
+
+        if not client.has_collection(settings.MILVUS_CHUNKS_COLLECTION):
+            schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+            schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=128)
+            schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dim)
+            schema.add_field("parent_id", DataType.VARCHAR, max_length=128)
+            schema.add_field("source", DataType.VARCHAR, max_length=512)
+            schema.add_field("sha256", DataType.VARCHAR, max_length=64)
+            schema.add_field("version", DataType.VARCHAR, max_length=32)
+            schema.add_field("page", DataType.VARCHAR, max_length=32)
+            schema.add_field("line_start", DataType.INT64)
+            schema.add_field("line_end", DataType.INT64)
+            schema.add_field("text", DataType.VARCHAR, max_length=2048)
+            index_params = client.prepare_index_params()
+            index_params.add_index(field_name="embedding", index_type="FLAT", metric_type="COSINE")
+            client.create_collection(
+                settings.MILVUS_CHUNKS_COLLECTION, schema=schema, index_params=index_params
+            )
+
+        if not client.has_collection(settings.MILVUS_PARENTS_COLLECTION):
+            schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+            schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=128)
+            # Milvus collection 必须有至少一个向量字段，父块用占位向量（不参与检索）
+            schema.add_field("dummy", DataType.FLOAT_VECTOR, dim=1)
+            schema.add_field("source", DataType.VARCHAR, max_length=512)
+            schema.add_field("sha256", DataType.VARCHAR, max_length=64)
+            schema.add_field("version", DataType.VARCHAR, max_length=32)
+            schema.add_field("page", DataType.VARCHAR, max_length=32)
+            schema.add_field("line_start", DataType.INT64)
+            schema.add_field("line_end", DataType.INT64)
+            schema.add_field("text", DataType.VARCHAR, max_length=8192)
+            client.create_collection(settings.MILVUS_PARENTS_COLLECTION, schema=schema)
+
+    def _insert(self, children: list[dict], parents: list[dict]) -> None:
+        client = self._get_client()
+        if children:
+            dim = len(children[0]["embedding"])
+            self._ensure_collections(dim)
+            client.upsert(settings.MILVUS_CHUNKS_COLLECTION, data=children)
+        if parents:
+            self._ensure_collections(0)
+            client.upsert(settings.MILVUS_PARENTS_COLLECTION, data=parents)
+
+    def _ensure_loaded(self) -> None:
+        client = self._get_client()
+        for collection in (settings.MILVUS_CHUNKS_COLLECTION, settings.MILVUS_PARENTS_COLLECTION):
+            if client.has_collection(collection):
+                client.load_collection(collection)
+
+    def _delete_source(self, source: str) -> None:
+        client = self._get_client()
+        client.delete(settings.MILVUS_CHUNKS_COLLECTION, filter=f'source == "{source}"')
+        client.delete(settings.MILVUS_PARENTS_COLLECTION, filter=f'source == "{source}"')
+
+    def _rename_source(self, old: str, new: str) -> None:
+        client = self._get_client()
+        self._ensure_loaded()
+        for collection in (settings.MILVUS_CHUNKS_COLLECTION, settings.MILVUS_PARENTS_COLLECTION):
+            rows = client.query(
+                collection,
+                filter=f'source == "{old}"',
+                output_fields=["*"],
+                limit=100000,
+            )
+            for row in rows:
+                row["source"] = new
+            if rows:
+                client.upsert(collection, data=rows)
+
+    def _existing_sha_by_source(self) -> dict[str, str]:
+        client = self._get_client()
+        if not client.has_collection(settings.MILVUS_CHUNKS_COLLECTION):
+            return {}
+        self._ensure_loaded()
+        rows = client.query(
+            settings.MILVUS_CHUNKS_COLLECTION,
+            filter='id != ""',
+            output_fields=["source", "sha256"],
+            limit=100000,
         )
+        result = {}
+        for row in rows:
+            result.setdefault(row["source"], row["sha256"])
+        return result
+
+    def _count_chunks(self) -> int:
+        try:
+            client = self._get_client()
+            if not client.has_collection(settings.MILVUS_CHUNKS_COLLECTION):
+                return 0
+            return client.get_collection_stats(settings.MILVUS_CHUNKS_COLLECTION).get("row_count", 0)
+        except Exception:
+            return 0
+
+    def is_indexed(self) -> bool:
+        return self._count_chunks() > 0
+
+    def _clear_all(self) -> None:
+        client = self._get_client()
+        for collection in (settings.MILVUS_CHUNKS_COLLECTION, settings.MILVUS_PARENTS_COLLECTION):
+            if client.has_collection(collection):
+                client.drop_collection(collection)
+
+    # —— 入库 ——
 
     async def _embed_doc(self, llm, doc: dict, version: str) -> tuple[list[dict], list[dict]]:
         """把文档切成父子块：父块不向量化，子块向量化并关联父块 ID。"""
@@ -241,6 +333,7 @@ class RAGEngine:
             parent_id = f"{doc['sha256']}:parent:{p_idx}"
             parents.append({
                 "id": parent_id,
+                "dummy": [0.0],
                 "source": doc["source"],
                 "sha256": doc["sha256"],
                 "version": version,
@@ -270,45 +363,19 @@ class RAGEngine:
         return children, parents
 
     async def index_documents(self, force: bool = False) -> dict:
-        """按「文件名 + SHA256」增量更新向量库（父子块）。
-
-        返回 {"indexed_chunks": 子块总数, "events": [人类可读的变更提示]}。
-
-        - 文件名与 SHA256 都不变 → 内容未变，不重新向量化，版本不变；
-        - 文件名不变、SHA256 变 → 内容更新，重新向量化，版本设为当前时间；
-        - 文件名变、SHA256 不变 → 只更新片段元数据里的文件名；
-        - 两者都变或全新 → 按新文件处理；
-        - 旧索引里存在但当前 docs 中不存在的 → 视为删除。
-        """
+        """按「文件名 + SHA256」增量更新向量库（父子块，存储到 Milvus）。"""
         docs = load_documents(settings.DOCS_DIR)
         if not docs:
-            self.chunks = []
-            self.parents = []
-            self._save()
+            self._clear_all()
             return {"indexed_chunks": 0, "events": ["知识库为空：docs 目录下没有可入库的文档。"]}
 
         if force:
             return await self._full_reindex(docs)
 
-        existing_children_by_source: dict[str, list[dict]] = {}
-        for chunk in self.chunks:
-            if "sha256" not in chunk:
-                continue
-            existing_children_by_source.setdefault(chunk["source"], []).append(chunk)
-        existing_parents_by_source: dict[str, list[dict]] = {}
-        for parent in self.parents:
-            if "sha256" not in parent:
-                continue
-            existing_parents_by_source.setdefault(parent["source"], []).append(parent)
-        existing_sha_by_source = {
-            source: chunks[0]["sha256"]
-            for source, chunks in existing_children_by_source.items()
-            if chunks
-        }
+        existing_sha_by_source = self._existing_sha_by_source()
+        existing_sources = set(existing_sha_by_source.keys())
 
         llm = get_llm_client()
-        new_children: list[dict] = []
-        new_parents: list[dict] = []
         events: list[str] = []
         claimed: set[str] = set()
 
@@ -317,18 +384,16 @@ class RAGEngine:
             sha = doc["sha256"]
 
             # 1) 文件名与 SHA256 都不变 → 内容未变
-            if source in existing_children_by_source and existing_sha_by_source.get(source) == sha:
-                new_children.extend(existing_children_by_source[source])
-                new_parents.extend(existing_parents_by_source.get(source, []))
+            if existing_sha_by_source.get(source) == sha:
                 claimed.add(source)
                 continue
 
             # 2) 文件名不变但 SHA256 变 → 内容更新
-            if source in existing_children_by_source:
+            if source in existing_sources:
+                self._delete_source(source)
                 version = _now_version()
                 children, parents = await self._embed_doc(llm, doc, version)
-                new_children.extend(children)
-                new_parents.extend(parents)
+                self._insert(children, parents)
                 claimed.add(source)
                 events.append(f"文件更新：{source}（版本 {version}）")
                 continue
@@ -340,14 +405,7 @@ class RAGEngine:
             ]
             if rename_candidates:
                 old = rename_candidates[0]
-                for chunk in existing_children_by_source[old]:
-                    renamed = dict(chunk)
-                    renamed["source"] = source
-                    new_children.append(renamed)
-                for parent in existing_parents_by_source.get(old, []):
-                    renamed = dict(parent)
-                    renamed["source"] = source
-                    new_parents.append(renamed)
+                self._rename_source(old, source)
                 claimed.add(old)
                 events.append(f"文件名变更：{old} → {source}")
                 continue
@@ -355,73 +413,95 @@ class RAGEngine:
             # 4) 全新文件
             version = _now_version()
             children, parents = await self._embed_doc(llm, doc, version)
-            new_children.extend(children)
-            new_parents.extend(parents)
+            self._insert(children, parents)
             events.append(f"新增文件：{source}（版本 {version}）")
 
         # 5) 删除检测：旧索引里未被认领的来源
-        for old in existing_children_by_source:
+        for old in existing_sources:
             if old not in claimed:
+                self._delete_source(old)
                 events.append(f"文件已删除：{old}")
 
-        self.chunks = new_children
-        self.parents = new_parents
-        self._save()
-        logger.info("rag_indexed", chunks=len(self.chunks), parents=len(self.parents), backend="json", events=len(events))
-        return {"indexed_chunks": len(self.chunks), "events": events}
+        logger.info("rag_indexed", chunks=self._count_chunks(), backend="milvus", events=len(events))
+        return {"indexed_chunks": self._count_chunks(), "events": events}
 
     async def _full_reindex(self, docs: list[dict]) -> dict:
+        self._clear_all()
         llm = get_llm_client()
         version = _now_version()
-        new_children = []
-        new_parents = []
         for doc in docs:
             children, parents = await self._embed_doc(llm, doc, version)
-            new_children.extend(children)
-            new_parents.extend(parents)
-        self.chunks = new_children
-        self.parents = new_parents
-        self._save()
-        logger.info("rag_reindexed", chunks=len(self.chunks), parents=len(self.parents), backend="json")
+            self._insert(children, parents)
+        logger.info("rag_reindexed", chunks=self._count_chunks(), backend="milvus")
         return {
-            "indexed_chunks": len(self.chunks),
+            "indexed_chunks": self._count_chunks(),
             "events": [f"全量重建：{len(docs)} 个文件，版本 {version}"],
         }
 
+    # —— 检索 ——
+
     async def retrieve(self, query: str, top_k: int | None = None) -> list[dict]:
-        """对子块做向量召回，返回 top_k 个子块（含 parent_id 与相似度）。"""
+        """对子块做向量召回（Milvus ANN 检索），返回 top_k 个子块。"""
         top_k = top_k or settings.RAG_TOP_K
-        if not self.chunks:
+        if not self.is_indexed():
             return []
 
         query_vector = (await get_llm_client().embed_texts([query]))[0]
+        self._ensure_loaded()
+        hits = self._get_client().search(
+            collection_name=settings.MILVUS_CHUNKS_COLLECTION,
+            data=[query_vector],
+            limit=top_k,
+            output_fields=[
+                "id", "parent_id", "source", "sha256", "version",
+                "page", "line_start", "line_end", "text",
+            ],
+        )
         results = []
-        for chunk in self.chunks:
-            results.append({
-                **{key: value for key, value in chunk.items() if key != "embedding"},
-                "similarity": round(cosine_similarity(query_vector, chunk["embedding"]), 4),
-            })
-        results.sort(key=lambda item: item["similarity"], reverse=True)
-        return results[:top_k]
+        for hit in (hits[0] if hits else []):
+            entity = hit.get("entity") if isinstance(hit, dict) else {}
+            distance = hit.get("distance") if isinstance(hit, dict) else 0.0
+            results.append({**entity, "similarity": round(float(distance), 4)})
+        return results
 
     def resolve_parents(self, child_chunks: list[dict]) -> list[dict]:
         """把召回的父块映射回父块并去重，返回父块（附带其子块最大相似度）。"""
-        parent_by_id = {parent["id"]: parent for parent in self.parents}
-        resolved = []
+        parent_ids = []
         seen = set()
         for child in child_chunks:
             pid = child.get("parent_id")
-            if pid is None or pid in seen:
-                continue
+            if pid and pid not in seen:
+                seen.add(pid)
+                parent_ids.append(pid)
+        if not parent_ids:
+            return []
+
+        in_filter = "id in [" + ", ".join(json.dumps(p) for p in parent_ids) + "]"
+        self._ensure_loaded()
+        rows = self._get_client().query(
+            collection_name=settings.MILVUS_PARENTS_COLLECTION,
+            filter=in_filter,
+            output_fields=["id", "source", "sha256", "version", "page", "line_start", "line_end", "text"],
+        )
+        parent_by_id = {row["id"]: row for row in rows}
+        sim_by_id = {}
+        for child in child_chunks:
+            pid = child.get("parent_id")
+            sim = child.get("similarity", 0.0)
+            if pid is not None and sim > sim_by_id.get(pid, -1.0):
+                sim_by_id[pid] = sim
+
+        resolved = []
+        for pid in parent_ids:
             parent = parent_by_id.get(pid)
-            if parent is None:
-                continue
-            seen.add(pid)
-            resolved.append({**parent, "similarity": child.get("similarity", 0.0)})
+            if parent is not None:
+                resolved.append({**parent, "similarity": sim_by_id.get(pid, 0.0)})
         return resolved
 
     async def close(self) -> None:
-        return None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
 
 _rag_engine: RAGEngine | None = None
@@ -507,7 +587,7 @@ async def _rerank(query: str, chunks: list[dict], top_k: int) -> list[dict]:
 
 async def search_docs(query: str, top_k: int | None = None) -> str:
     engine = get_rag_engine()
-    if not engine.chunks:
+    if not engine.is_indexed():
         result = await engine.index_documents()
         if result["indexed_chunks"] == 0:
             return "知识库为空：请把文档放到 docs 目录下，然后重试。"

@@ -1,19 +1,19 @@
 # Office Agent
 
-基于 OpenAI 兼容接口的企业办公智能助手原型，当前支持：
+基于 OpenAI 兼容接口的企业办公智能助手，当前支持：
 
-- 多轮对话与 Redis 会话历史
-- Function Calling 工具调用
-- 本地 Markdown、TXT、CSV、Excel 文档检索
-- Excel 工作表查询
-- 对话 Trace 查询
-- 用户画像与情景记忆
+- 多轮对话 + ReAct 式 Function Calling 工具调用（计算器 / Excel / 联网搜索 / 知识库检索）
+- 本地知识库 RAG：父子切块 + 查询改写 + Milvus 向量检索 + Cross-encoder 重排 + 增量索引 + 内容溯源
+- 短期会话摘要 + 长期用户画像 / 情景记忆
+- 结构化 Trace 调用链（step 级，按 trace_id 查询）
+- structlog 结构化日志
+- FastAPI HTTP 服务（X-API-Key 鉴权 + 滑动窗口限流）
 
 ## 快速开始
 
 ### 1. 准备环境
 
-要求：Python 3.11+、一个 OpenAI 兼容的 LLM API；Redis 仅用于会话历史和长期记忆。
+要求：Python 3.11+、一个 OpenAI 兼容的 LLM API；Redis 用于会话历史、长期记忆与 Trace；向量库使用 Milvus（默认 Milvus Lite 嵌入式，无需独立部署）。
 
 ```powershell
 python -m venv .venv
@@ -38,7 +38,7 @@ docker compose ps
 python main.py
 ```
 
-首次使用本地知识库时，程序会读取 `docs/` 下的 `.txt`、`.md`、`.csv` 和 `.xlsx` 文件并建立本地 JSON 向量索引，索引文件保存在 `vector_data/`，不需要额外数据库。
+首次使用本地知识库时，程序会读取 `docs/` 下的 `.txt`、`.md`、`.csv` 和 `.xlsx` 文件并建立父子切块，向量存储到 **Milvus**（默认 Milvus Lite 嵌入式，数据落盘在 `milvus_data/`；也可通过 `MILVUS_URI` 指向 Milvus 服务版）。
 
 文档采用**父子切块**：父块按段落合并（约 2000-3000 token、无重叠、不向量化），子块在父块内按句切分（约 100-200 token、25% 重叠、做向量化并关联父块 ID）。检索时先召回子块，再映射回父块去重，注入 LLM 的是父块全文。
 
@@ -82,7 +82,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/chat -Headers $
 python -m pytest -q
 ```
 
-测试不依赖真实 LLM、联网搜索或 Redis，会自动隔离外部服务并验证核心安全边界。
+测试不依赖真实 LLM、Embedding、联网搜索、Redis 或 Milvus，会自动隔离外部服务并验证核心安全边界；当前 35 个用例，覆盖率阈值 40%。
 
 项目已配置 GitHub Actions。推送代码或创建 Pull Request 时，会在 Python 3.11 和 3.12 环境自动执行测试、覆盖率统计和源码编译检查。
 
@@ -114,12 +114,18 @@ python evals/run_rag_eval.py
 
 忠诚度评测会额外调用轻量模型，想省 API 调用可加 `--no-faithfulness` 跳过；每个问题的论断级核验明细在输出的 `details[].claims` 中，便于人工抽查。重排需配置 `RERANK_API_KEY`，未配置时自动回退余弦顺序（此时 rerank 指标等价于召回阶段截断）。
 
+## 可观测性
+
+**Trace 调用链**：每次对话生成 step 级结构化 Trace，记录 LLM 推理、工具调用、知识库检索、记忆读写与错误各阶段的 Token 消耗与耗时；知识库检索步骤会额外记录查询改写结果与命中片段（来源/版本/行号/相似度）。Trace 持久化到 Redis，可用 `trace_id` 查询。
+
+**日志**：全链路使用 structlog 输出 key=value 结构化日志，便于日志采集与检索。
+
 ## 配置校验
 
-程序启动时会检查必填模型配置、超时、重试次数和 RAG 分块参数。配置不完整时会直接输出缺失项，而不是运行到第一次请求才失败。
+程序启动时会检查必填模型配置、超时、重试次数、RAG 分块与重排参数。配置不完整时会直接输出缺失项，而不是运行到第一次请求才失败。
 
 ## 当前边界
 
-联网搜索使用 Brave Search API，需要在 `.env` 中配置 `SEARCH_API_KEY`；未配置时会明确返回不可用，不会伪造搜索结果。工具参数会经过严格校验，计算器不执行任意 Python 代码，Excel 只能读取 `data/` 目录内的表格文件。
+联网搜索使用 Brave Search API，需要在 `.env` 中配置 `SEARCH_API_KEY`；未配置时会明确返回不可用，不会伪造搜索结果。Cross-encoder 重排使用 Qwen Reranker，需配置 `RERANK_API_KEY`，未配置时回退余弦顺序。工具参数会经过严格校验，计算器不执行任意 Python 代码，Excel 只能读取 `data/` 目录内的表格文件。
 
-当前仍未覆盖生产级分布式限流和多实例共享限流状态，这些属于后续增强项。
+向量库默认使用 Milvus Lite（嵌入式，适合单机原型），生产多实例可切换 `MILVUS_URI` 到 Milvus 服务版并把索引类型改为 HNSW。当前仍未覆盖生产级分布式限流和多实例共享限流状态，这些属于后续增强项。

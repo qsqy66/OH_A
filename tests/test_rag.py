@@ -33,34 +33,6 @@ class FakeEmbedLLM:
         return [[0.1] * 8 for _ in texts]
 
 
-def _child(source, sha, parent_id=None, version="2026-10-20 10:00:00"):
-    return {
-        "id": f"{sha}:child:0",
-        "parent_id": parent_id or f"{sha}:parent:0",
-        "source": source,
-        "sha256": sha,
-        "version": version,
-        "page": "N/A",
-        "line_start": 1,
-        "line_end": 1,
-        "text": "子块正文",
-        "embedding": [0.0] * 8,
-    }
-
-
-def _parent(source, sha, version="2026-10-20 10:00:00"):
-    return {
-        "id": f"{sha}:parent:0",
-        "source": source,
-        "sha256": sha,
-        "version": version,
-        "page": "N/A",
-        "line_start": 1,
-        "line_end": 2,
-        "text": "父块正文",
-    }
-
-
 def test_index_documents_incremental(monkeypatch):
     # 当前 docs：a 未变、b 内容更新、c 改名自 old_c、d 新增
     docs = [
@@ -70,37 +42,40 @@ def test_index_documents_incremental(monkeypatch):
         {"source": "d.md", "text": "D内容", "sha256": "sha_d"},
     ]
     engine = rag.RAGEngine.__new__(rag.RAGEngine)
-    engine.chunks = [
-        _child("a.md", "sha_a"),
-        _child("b.md", "sha_b1"),
-        _child("old_c.md", "sha_c"),
-    ]
-    engine.parents = [
-        _parent("a.md", "sha_a"),
-        _parent("b.md", "sha_b1"),
-        _parent("old_c.md", "sha_c"),
-    ]
-    monkeypatch.setattr(engine, "_save", lambda: None)
+    monkeypatch.setattr(
+        engine, "_existing_sha_by_source",
+        lambda: {"a.md": "sha_a", "b.md": "sha_b1", "old_c.md": "sha_c"},
+    )
+
+    inserted = []
+    deleted = []
+    renamed = []
+
+    def fake_insert(children, parents):
+        inserted.extend(c["source"] for c in children)
+
+    def fake_delete(source):
+        deleted.append(source)
+
+    def fake_rename(old, new):
+        renamed.append((old, new))
+
+    monkeypatch.setattr(engine, "_insert", fake_insert)
+    monkeypatch.setattr(engine, "_delete_source", fake_delete)
+    monkeypatch.setattr(engine, "_rename_source", fake_rename)
+    monkeypatch.setattr(engine, "_count_chunks", lambda: 99)
+
     fake = FakeEmbedLLM()
     monkeypatch.setattr(rag, "load_documents", lambda _dir: docs)
     monkeypatch.setattr(rag, "get_llm_client", lambda: fake)
 
     result = asyncio.run(engine.index_documents())
 
-    # 只有 b（更新）和 d（新增）需要重新向量化；a（未变）、c（改名）不需要
-    assert fake.embed_calls == 2
-    assert {c["source"] for c in engine.chunks} == {"a.md", "b.md", "c_新名.md", "d.md"}
-    assert {p["source"] for p in engine.parents} == {"a.md", "b.md", "c_新名.md", "d.md"}
-
-    a = next(c for c in engine.chunks if c["source"] == "a.md")
-    assert a["version"] == "2026-10-20 10:00:00"  # 未变，版本不变
-
-    c = next(c for c in engine.chunks if c["source"] == "c_新名.md")
-    assert c["sha256"] == "sha_c"  # 改名，内容指纹不变
-
-    b = next(c for c in engine.chunks if c["source"] == "b.md")
-    assert b["sha256"] == "sha_b2"
-    assert b["version"] != "2026-10-20 10:00:00"  # 更新，版本刷新
+    # b 更新、d 新增 → 重新向量化插入；a 未变、c 改名 → 不重新向量化
+    assert set(inserted) == {"b.md", "d.md"}
+    assert renamed == [("old_c.md", "c_新名.md")]
+    assert deleted == ["b.md"]  # b 更新时先删旧
+    assert result["indexed_chunks"] == 99
 
     events = result["events"]
     assert any("文件更新：b.md" in e for e in events)
@@ -139,17 +114,8 @@ def test_search_docs_records_rag_retrieve_trace(monkeypatch):
             return "改写后的检索式"
 
     class FakeEngine:
-        chunks = [{"source": "x"}]
-        parents = [{
-            "id": "p1",
-            "source": "公司考勤与请假制度.md",
-            "sha256": "abc123",
-            "version": "2026-08-27 19:36:13",
-            "page": "N/A",
-            "line_start": 1,
-            "line_end": 2,
-            "text": "父块正文",
-        }]
+        def is_indexed(self):
+            return True
 
         async def retrieve(self, _query, _top_k=None):
             return [{
@@ -166,7 +132,17 @@ def test_search_docs_records_rag_retrieve_trace(monkeypatch):
             }]
 
         def resolve_parents(self, _child_chunks):
-            return [dict(self.parents[0], similarity=0.9)]
+            return [{
+                "id": "p1",
+                "source": "公司考勤与请假制度.md",
+                "sha256": "abc123",
+                "version": "2026-08-27 19:36:13",
+                "page": "N/A",
+                "line_start": 1,
+                "line_end": 2,
+                "text": "父块正文",
+                "similarity": 0.9,
+            }]
 
     monkeypatch.setattr(rag, "get_rag_engine", lambda: FakeEngine())
     monkeypatch.setattr(rag, "get_llm_client", lambda: FakeLLM())
@@ -248,12 +224,23 @@ def test_split_children_sentence_based_with_overlap():
     assert rag._split_children("甲。乙。丙。丁。戊。", 4, 0.25) == ["甲。乙。", "乙。丙。", "丙。丁。", "丁。戊。"]
 
 
-def test_resolve_parents_dedup():
+def test_resolve_parents_dedup(monkeypatch):
+    class FakeClient:
+        def has_collection(self, _name):
+            return True
+
+        def load_collection(self, _name):
+            return None
+
+        def query(self, collection_name=None, filter=None, output_fields=None, limit=None):
+            return [
+                {"id": "sha:p:0", "source": "a.md", "text": "A", "version": "v", "page": "N/A", "line_start": 1, "line_end": 1, "sha256": "sha"},
+                {"id": "sha:p:1", "source": "b.md", "text": "B", "version": "v", "page": "N/A", "line_start": 1, "line_end": 1, "sha256": "sha"},
+            ]
+
     engine = rag.RAGEngine.__new__(rag.RAGEngine)
-    engine.parents = [
-        {"id": "sha:p:0", "source": "a.md", "text": "A", "version": "v", "page": "N/A", "line_start": 1, "line_end": 1, "sha256": "sha"},
-        {"id": "sha:p:1", "source": "b.md", "text": "B", "version": "v", "page": "N/A", "line_start": 1, "line_end": 1, "sha256": "sha"},
-    ]
+    monkeypatch.setattr(engine, "_get_client", lambda: FakeClient())
+
     children = [
         {"parent_id": "sha:p:0", "similarity": 0.9},
         {"parent_id": "sha:p:0", "similarity": 0.7},  # 重复父块

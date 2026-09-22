@@ -141,7 +141,7 @@ async def evaluate_faithfulness(llm, answer: str, context: str) -> dict:
 async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
     questions = load_questions(path)
     engine = get_rag_engine()
-    if not engine.chunks:
+    if not engine.is_indexed():
         await engine.index_documents()
 
     llm = get_llm_client()

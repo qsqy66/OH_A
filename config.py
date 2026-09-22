@@ -98,7 +98,12 @@ class Settings:
     # 文档存放目录 — PDF/Word/Excel 放这里，程序自动扫描
     DOCS_DIR: str = os.getenv("DOCS_DIR", "./docs")
 
-    # 本地 JSON 向量索引配置（无需额外数据库）
+    # 向量库：Milvus（Lite 用本地文件 URI，如 ./milvus_data/milvus.db；服务版用 http://host:19530）
+    MILVUS_URI: str = os.getenv("MILVUS_URI", "./milvus_data/milvus.db")
+    MILVUS_CHUNKS_COLLECTION: str = os.getenv("MILVUS_CHUNKS_COLLECTION", "rag_chunks")
+    MILVUS_PARENTS_COLLECTION: str = os.getenv("MILVUS_PARENTS_COLLECTION", "rag_parents")
+
+    # 旧版本地 JSON 向量索引（已被 Milvus 取代，保留兼容）
     VECTOR_PERSIST_DIR: str = os.getenv("VECTOR_PERSIST_DIR", "./vector_data")
     VECTOR_COLLECTION: str = os.getenv("VECTOR_COLLECTION", "office_docs")
 
