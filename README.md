@@ -48,7 +48,7 @@ python main.py
 
 检索前会先用轻量模型对口语化问题做**查询改写**（补全关键词、保留专有名词与数字），提升语义检索命中率；改写失败会自动回退原问题。可用 `RAG_QUERY_REWRITE=false` 关闭。
 
-检索采用**三段式**：先向量召回 Top-10 子块，再映射回父块去重，最后用 Cross-encoder 重排（Qwen Reranker）精排父块取 Top-3 注入 LLM 上下文；未配置 `RERANK_API_KEY` 或重排失败时自动回退余弦相似度顺序。子块召回数由 `RAG_RECALL_TOP_K`、最终父块数由 `RAG_TOP_K` 控制。
+检索采用**多路召回 + 重排**：先用轻量模型判断单/多意图，多意图拆成若干子问题；每路「向量召回 Top-10 子块 → 映射父块 → Cross-encoder 重排取 Top-N」；多路结果按父块去重合并后全量注入 LLM（上限 `RAG_MAX_PARENTS`）。未配置 `RERANK_API_KEY` 或重排失败时自动回退余弦相似度顺序。子块召回数由 `RAG_RECALL_TOP_K`、每路父块数由 `RAG_TOP_K`、多意图拆解由 `RAG_QUERY_DECOMPOSE` 控制。
 
 输入 `1` 进入多轮对话，输入 `2` 根据 Trace ID 查询调用链，输入 `3` 增量更新本地知识库索引（新增、修改或重命名 `docs/` 下的文档后使用）；输入 `exit`、`quit` 或 `不聊了`退出。
 
@@ -88,7 +88,7 @@ python -m pytest -q
 
 ### 6. 运行 RAG 评测
 
-项目提供 20 条多文档复杂问题作为评测集，位置为 `evals/rag_questions.jsonl`，每条问题的答案需综合两个及以上文档，且提问采用口语化、多样化问法（在哪/多少钱/怎么办/啥时候等）以检验检索对改写表述的鲁棒性。配置真实 LLM 和 Embedding 后运行：
+项目提供 25 条多文档复杂问题作为评测集，位置为 `evals/rag_questions.jsonl`：其中 20 条答案综合两个文档，5 条答案需综合 **5–7 个文档**（用于检验多路召回），提问采用口语化、多样化问法（在哪/多少钱/怎么办/啥时候等）以检验检索对改写表述的鲁棒性。配置真实 LLM 和 Embedding 后运行：
 
 ```powershell
 python evals/run_rag_eval.py

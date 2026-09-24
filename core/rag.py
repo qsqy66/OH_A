@@ -210,7 +210,14 @@ class RAGEngine:
             # Milvus Lite（本地文件 URI）要求目录已存在，先创建
             if not uri.startswith(("http://", "https://")):
                 Path(uri).parent.mkdir(parents=True, exist_ok=True)
-            self._client = MilvusClient(uri=uri)
+            # 关闭空闲 keepalive，避免 gRPC 报 too_many_pings / GOAWAY 刷屏
+            self._client = MilvusClient(
+                uri=uri,
+                grpc_options={
+                    "grpc.keepalive_permit_without_calls": False,
+                    "grpc.keepalive_time_ms": 60000,
+                },
+            )
         return self._client
 
     def _ensure_collections(self, dim: int) -> None:
@@ -585,6 +592,74 @@ async def _rerank(query: str, chunks: list[dict], top_k: int) -> list[dict]:
         return chunks[:top_k]
 
 
+def _parse_json_dict(text: str) -> dict:
+    """从模型输出中稳健解析 JSON 对象；失败返回空 dict。"""
+    if not text:
+        return {}
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                data = {}
+        else:
+            data = {}
+    return data if isinstance(data, dict) else {}
+
+
+_INTENT_PROMPT = (
+    "判断下面的问题是否需要拆分。若为单一意图（只问一件事），返回 {\"single\": true, \"sub_queries\": []}；"
+    "若为多意图（涉及多个独立子问题、需要综合多个方面信息），返回 {\"single\": false, \"sub_queries\": [\"子问题1\", \"子问题2\", ...]}。"
+    "只输出 JSON，不要其他内容。"
+)
+
+
+async def _decompose(query: str) -> list[str]:
+    """判断单/多意图：多意图拆成子问题列表，单意图返回原问题；关闭或失败回退单路。"""
+    if not settings.RAG_QUERY_DECOMPOSE:
+        return [query]
+    try:
+        resp = (await get_llm_client().lite_chat(_INTENT_PROMPT, f"问题：{query}")).strip()
+        data = _parse_json_dict(resp)
+        sub_queries = [str(q).strip() for q in data.get("sub_queries", []) if str(q).strip()]
+        if data.get("single") or not sub_queries:
+            return [query]
+        return sub_queries
+    except Exception as exc:
+        logger.warning("rag_decompose_failed", error=str(exc))
+        return [query]
+
+
+def _dedup_by_id(results: list[dict]) -> list[dict]:
+    """按 id 去重，保留首次出现顺序，相似度取最大。"""
+    seen = {}
+    order = []
+    for item in results:
+        pid = item.get("id")
+        if pid is None:
+            continue
+        if pid not in seen:
+            seen[pid] = item
+            order.append(pid)
+        elif item.get("similarity", 0.0) > seen[pid].get("similarity", 0.0):
+            seen[pid] = item
+    return [seen[pid] for pid in order]
+
+
+async def _route_retrieve(engine, sub_query: str, top_k: int) -> tuple[str, list[dict]]:
+    """单路检索：改写 → 召回子块 → 映射父块 → 重排取 top_k。返回 (改写后的检索式, 父块列表)。"""
+    rewritten = await _rewrite_query(sub_query)
+    child_results = await engine.retrieve(rewritten, settings.RAG_RECALL_TOP_K)
+    parents = engine.resolve_parents(child_results)
+    results = await _rerank(rewritten, parents, top_k)
+    return rewritten, results
+
+
 async def search_docs(query: str, top_k: int | None = None) -> str:
     engine = get_rag_engine()
     if not engine.is_indexed():
@@ -592,18 +667,30 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
         if result["indexed_chunks"] == 0:
             return "知识库为空：请把文档放到 docs 目录下，然后重试。"
 
-    search_query = await _rewrite_query(query)
     final_k = top_k or settings.RAG_TOP_K
-    child_results = await engine.retrieve(search_query, settings.RAG_RECALL_TOP_K)
-    parents = engine.resolve_parents(child_results)
-    results = await _rerank(search_query, parents, final_k)
+
+    # 意图判断 + 拆分：单意图一路，多意图拆成 N 路子问题
+    sub_queries = await _decompose(query)
+
+    # N 路召回：每路独立 改写 → 召回 → 重排取 top_k
+    route_results = await asyncio.gather(*[
+        _route_retrieve(engine, sq, final_k) for sq in sub_queries
+    ])
+
+    # 合并 + parent_id 去重，安全上限防止上下文爆炸
+    rewritten_queries = []
+    merged = []
+    for rewritten, route in route_results:
+        rewritten_queries.append(rewritten)
+        merged.extend(route)
+    results = _dedup_by_id(merged)[: settings.RAG_MAX_PARENTS]
 
     trace = current_trace.get()
     if trace is not None:
         trace.add_step(
             step_type="rag_retrieve",
             description="知识库检索",
-            rewritten_query=search_query if search_query != query else None,
+            rewritten_query=rewritten_queries[0] if len(rewritten_queries) == 1 else json.dumps(rewritten_queries, ensure_ascii=False),
             retrieved_chunks=[
                 {
                     "source": item["source"],
@@ -623,7 +710,7 @@ async def search_docs(query: str, top_k: int | None = None) -> str:
     for index, result in enumerate(results, 1):
         location = f"第 {result['line_start']}-{result['line_end']} 行"
         lines.append(
-            f"\n[片段{index}] 来源：{result['source']}（版本：{result['version']}，"
+            f"\n[片段{index}] 参考文档：{result['source']}（版本：{result['version']}，"
             f"页码：{result['page']}，{location}）"
             f"\n相关度：{result.get('similarity', '')}\n{result['text']}"
         )

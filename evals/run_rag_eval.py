@@ -13,7 +13,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from config import settings
 from core.llm_client import get_llm_client
-from core.rag import get_rag_engine, _rerank
+from core.rag import get_rag_engine, _rerank, _decompose, _rewrite_query, _dedup_by_id
 
 
 ROOT = Path(__file__).parent
@@ -161,30 +161,40 @@ async def evaluate(path: Path, with_faithfulness: bool = True) -> dict:
         query = question["query"]
         relevant = _relevant_sources(question)
 
-        # 1) 召回阶段：向量检索 Top-N（重排前，衡量召回能力）
-        recall_results = await engine.retrieve(query, settings.RAG_RECALL_TOP_K)
-        recall_sources = [item["source"] for item in recall_results]
+        # 1) 召回阶段：拆解 → 每路向量召回（不 rerank），衡量召回能力
+        sub_queries = await _decompose(query)
+        recall_children = []       # 所有路的子块
+        recall_entries = []        # (rewritten, parents) 每路
+        for sq in sub_queries:
+            rewritten = await _rewrite_query(sq)
+            children = await engine.retrieve(rewritten, settings.RAG_RECALL_TOP_K)
+            recall_children.extend(children)
+            recall_entries.append((rewritten, engine.resolve_parents(children)))
 
+        recall_sources = [item["source"] for item in recall_children]
         recall_hit = bool(set(recall_sources) & relevant)
         recall_hit_count += int(recall_hit)
 
-        chunk_recall = _chunk_recall(recall_results, question)
+        chunk_recall = _chunk_recall(recall_children, question)
         recall = chunk_recall if chunk_recall is not None else _source_recall(recall_sources, relevant)
         recall_sum += recall
 
         recall_first_rank = next((i + 1 for i, s in enumerate(recall_sources) if s in relevant), None)
         recall_mrr_sum += 1.0 / recall_first_rank if recall_first_rank else 0.0
 
-        # 2) 重排阶段：子块映射回父块去重后，Cross-encoder 精排父块取最终 Top-K（衡量重排收益）
-        parents = engine.resolve_parents(recall_results)
-        final_results = await _rerank(query, parents, settings.RAG_TOP_K)
+        # 2) 最终阶段：每路 rerank 取 Top-K，合并去重（与生产 search_docs 一致）
+        merged = []
+        for rewritten, parents in recall_entries:
+            merged.extend(await _rerank(rewritten, parents, settings.RAG_TOP_K))
+        final_results = _dedup_by_id(merged)[: settings.RAG_MAX_PARENTS]
         final_sources = [item["source"] for item in final_results]
 
         rerank_hit = bool(set(final_sources) & relevant)
         rerank_hit_count += int(rerank_hit)
 
-        # 重排丢失率：召回找到的相关来源里，重排后丢掉了多少（越低越好，0 = 无丢失）
-        recall_relevant = set(p["source"] for p in parents) & relevant
+        # 重排丢失率：多路召回（合并去重前）的相关来源里，最终结果丢掉了多少（越低越好，0 = 无丢失）
+        recall_parents = [p for _, parents in recall_entries for p in parents]
+        recall_relevant = set(p["source"] for p in recall_parents) & relevant
         recall_relevant_count = len(recall_relevant)
         final_relevant_count = len(set(final_sources) & relevant)
         loss = (recall_relevant_count - final_relevant_count) / recall_relevant_count if recall_relevant_count else None

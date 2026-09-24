@@ -128,6 +128,12 @@ class Settings:
     # 查询改写开关：用轻量模型把口语化问题改写成检索式，失败自动回退原问题
     RAG_QUERY_REWRITE: bool = os.getenv("RAG_QUERY_REWRITE", "true").lower() in ("1", "true", "yes")
 
+    # 查询分解：多意图问题拆成子问题做多路召回（false 则始终单路）
+    RAG_QUERY_DECOMPOSE: bool = os.getenv("RAG_QUERY_DECOMPOSE", "true").lower() in ("1", "true", "yes")
+
+    # 多路召回合并去重后父块总数的安全上限，防止上下文爆炸
+    RAG_MAX_PARENTS: int = int(os.getenv("RAG_MAX_PARENTS", "10"))
+
     # Cross-encoder 重排（Qwen Reranker）：未配置 Key 或调用失败时回退余弦顺序
     RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes")
     RERANK_API_KEY: str = os.getenv("RERANK_API_KEY", "")
@@ -199,6 +205,8 @@ class Settings:
             errors.append("CHILD_CHUNK_TOKENS 必须大于 0")
         if not 0 <= self.CHILD_CHUNK_OVERLAP < 1:
             errors.append("CHILD_CHUNK_OVERLAP 必须大于等于 0 且小于 1")
+        if self.RAG_MAX_PARENTS <= 0:
+            errors.append("RAG_MAX_PARENTS 必须大于 0")
         if self.TOOL_TIMEOUT <= 0:
             errors.append("TOOL_TIMEOUT 必须大于 0")
         if self.TOOL_OUTPUT_MAX_CHARS <= 0:

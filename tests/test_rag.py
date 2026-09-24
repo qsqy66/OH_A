@@ -249,3 +249,49 @@ def test_resolve_parents_dedup(monkeypatch):
     resolved = engine.resolve_parents(children)
     assert [p["source"] for p in resolved] == ["a.md", "b.md"]  # 去重
     assert resolved[0]["similarity"] == 0.9  # 取最大子块相似度
+
+
+def test_decompose_disabled_returns_single(monkeypatch):
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_DECOMPOSE", False)
+    assert asyncio.run(rag._decompose("问题")) == ["问题"]
+
+
+def test_decompose_single_intent(monkeypatch):
+    class FakeLLM:
+        async def lite_chat(self, *_args, **_kwargs):
+            return '{"single": true, "sub_queries": []}'
+
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_DECOMPOSE", True)
+    monkeypatch.setattr(rag, "get_llm_client", lambda: FakeLLM())
+    assert asyncio.run(rag._decompose("加班费怎么算")) == ["加班费怎么算"]
+
+
+def test_decompose_multi_intent(monkeypatch):
+    class FakeLLM:
+        async def lite_chat(self, *_args, **_kwargs):
+            return '{"single": false, "sub_queries": ["入职流程", "员工福利"]}'
+
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_DECOMPOSE", True)
+    monkeypatch.setattr(rag, "get_llm_client", lambda: FakeLLM())
+    assert asyncio.run(rag._decompose("新员工入职流程和福利分别是什么")) == ["入职流程", "员工福利"]
+
+
+def test_decompose_fails_open(monkeypatch):
+    class BoomLLM:
+        async def lite_chat(self, *_args, **_kwargs):
+            raise RuntimeError("no api")
+
+    monkeypatch.setattr(rag.settings, "RAG_QUERY_DECOMPOSE", True)
+    monkeypatch.setattr(rag, "get_llm_client", lambda: BoomLLM())
+    assert asyncio.run(rag._decompose("原始问题")) == ["原始问题"]
+
+
+def test_dedup_by_id_keeps_max_similarity():
+    results = [
+        {"id": "p1", "similarity": 0.5, "source": "a.md"},
+        {"id": "p2", "similarity": 0.7, "source": "b.md"},
+        {"id": "p1", "similarity": 0.9, "source": "a.md"},  # 重复，相似度更高
+    ]
+    deduped = rag._dedup_by_id(results)
+    assert [r["id"] for r in deduped] == ["p1", "p2"]
+    assert deduped[0]["similarity"] == 0.9  # 保留最大相似度
