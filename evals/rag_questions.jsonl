@@ -1,0 +1,12 @@
+{"id":"q01","query":"标准工时制每天几点上班？","expected_sources":["公司考勤与请假制度.md"],"expected_keywords":["9:00","18:30"]}
+{"id":"q02","query":"漏打卡需要在几天内提交补卡申请？","expected_sources":["公司考勤与请假制度.md"],"expected_keywords":["三个工作日"]}
+{"id":"q03","query":"入职满一年到十年，年假有几天？","expected_sources":["公司考勤与请假制度.md"],"expected_keywords":["5天"]}
+{"id":"q04","query":"工作日加班按基本工资多少倍计算？","expected_sources":["公司考勤与请假制度.md"],"expected_keywords":["1.5倍"]}
+{"id":"q05","query":"连续旷工几天公司有权解除劳动合同？","expected_sources":["公司考勤与请假制度.md"],"expected_keywords":["3天"]}
+{"id":"q06","query":"北京出差住宿标准是多少？","expected_sources":["差旅报销标准.csv"],"expected_keywords":["500"]}
+{"id":"q07","query":"杭州出差每天餐补是多少？","expected_sources":["差旅报销标准.csv"],"expected_keywords":["80"]}
+{"id":"q08","query":"三线及以下城市的市内交通标准是多少？","expected_sources":["差旅报销标准.csv"],"expected_keywords":["40"]}
+{"id":"q09","query":"如何重置账号密码？","expected_sources":["产品使用常见问题.txt"],"expected_keywords":["忘记密码","注册邮箱"]}
+{"id":"q10","query":"系统每天几点自动备份数据？","expected_sources":["产品使用常见问题.txt"],"expected_keywords":["凌晨2点"]}
+{"id":"q11","query":"单次数据报表导出上限是多少？","expected_sources":["产品使用常见问题.txt"],"expected_keywords":["10万行"]}
+{"id":"q12","query":"接口调用失败时，401和429分别代表什么？","expected_sources":["产品使用常见问题.txt"],"expected_keywords":["401","429"]}

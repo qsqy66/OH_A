@@ -98,11 +98,9 @@ class Settings:
     # 文档存放目录 — PDF/Word/Excel 放这里，程序自动扫描
     DOCS_DIR: str = os.getenv("DOCS_DIR", "./docs")
 
-    # ChromaDB 数据持久化路径（重启不丢数据）
-    CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
-
-    # ChromaDB 的 collection 名称（相当于数据库的"表"）
-    CHROMA_COLLECTION: str = os.getenv("CHROMA_COLLECTION", "office_docs")
+    # 本地 JSON 向量索引配置（无需额外数据库）
+    VECTOR_PERSIST_DIR: str = os.getenv("VECTOR_PERSIST_DIR", "./vector_data")
+    VECTOR_COLLECTION: str = os.getenv("VECTOR_COLLECTION", "office_docs")
 
     # 文本分块：每块字符数 / 相邻块重叠字符数
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
@@ -173,6 +171,8 @@ class Settings:
             errors.append("TOOL_TIMEOUT 必须大于 0")
         if self.TOOL_OUTPUT_MAX_CHARS <= 0:
             errors.append("TOOL_OUTPUT_MAX_CHARS 必须大于 0")
+        if self.RAG_TOP_K <= 0:
+            errors.append("RAG_TOP_K 必须大于 0")
         return errors
 
     def require_valid(self) -> None:

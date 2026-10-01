@@ -1,6 +1,7 @@
 import asyncio
 import structlog
 import json
+import re
 from pathlib import Path
 import sys
 from tools.registry import tools_excutor, build_tool_message
@@ -23,7 +24,19 @@ SYSTEM_PROMPT = """
 只输出标准的function‑call工具调用，不要输出自然语言思考内容。
 所有推理只在function‑call内部完成，不要把思考写在输出文本中。
 如果需要向用户提问，直接在tool调用结束后的assistant content返回，不要混入工具参数
+如果使用了 search_docs，最终回答必须包含“来源：文件名”形式的来源信息；不能只给结论而省略来源。
 """
+
+
+def _append_sources(answer: str, sources: list[str]) -> str:
+    unique_sources = list(dict.fromkeys(source for source in sources if source))
+    if not unique_sources or "来源：" in answer:
+        return answer
+    return answer.rstrip() + "\n\n来源：" + "、".join(unique_sources)
+
+
+def _extract_sources(tool_output: str) -> list[str]:
+    return re.findall(r"来源：([^（\n]+)", tool_output or "")
 
 
 def _build_memory_block(memory_ctx: dict) -> str:
@@ -61,6 +74,7 @@ class AgentLoop():
         messages.append({"role":"user","content":query})
         await redis.append_history(session_id, {"role":"user","content":query})
         trace = TraceLog(session_id=session_id)
+        retrieved_sources: list[str] = []
 
         # —— 记忆注入：短期(会话摘要) + 长期(用户画像 / 相关情景记忆) ——
         # 记忆为空或加载失败时 memory_ctx 为空 dict，不注入任何内容，不影响主流程
@@ -130,6 +144,8 @@ class AgentLoop():
                     tc_name = tc.function.name
                     tc_args = tc.function.arguments
                     result = await tools_excutor(tc_name, tc_args)
+                    if tc_name == "search_docs":
+                        retrieved_sources.extend(_extract_sources(result))
                     messages.append(build_tool_message(tc.id, result))
                     
                     logger.debug(
@@ -153,6 +169,7 @@ class AgentLoop():
                     content = choice.message.content
                 )
                 # 设置最终答案（内部自动赋值end_time）
+                chat_content = _append_sources(chat_content, retrieved_sources)
                 trace.set_final_answer(chat_content)
                 await redis.append_history(session_id, {"role":"assistant","content":chat_content})
                 # 记忆写入：回答完成后提取画像/情景记忆，并在会话达到阈值时压缩摘要
